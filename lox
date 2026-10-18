@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Avvio del toolkit Loxone da Bash (Linux, macOS, Git Bash su Windows):  ./lox <comando>
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+for PY in "$DIR/.venv/Scripts/python.exe" "$DIR/.venv/bin/python"; do
+  [ -x "$PY" ] && exec "$PY" "$DIR/lox.py" "$@"
+done
+echo "ERRORE: ambiente Python non trovato in $DIR/.venv (vedi README, \"Installazione\")" >&2
+exit 1
