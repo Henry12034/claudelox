@@ -1,0 +1,18 @@
+# ambiente Python
+.venv/
+__pycache__/
+*.pyc
+
+# credenziali, token e cache: privati
+.env
+.state/
+
+# dati del singolo impianto: privati
+CLAUDE.local.md
+.claude/settings.local.json
+
+# esportazioni (i programmi contengono indirizzo di casa, utenti e password di dispositivi)
+data/
+*.Loxone
+*.LoxCC
+sps_*.zip
