@@ -35,7 +35,7 @@ l'utente in un terminale, mai in chat).
 | `dispositivi` | dispositivi esterni del programma (Shelly, Raspberry, meteo): raggiungibili? quale modello? | no |
 | `shelly trova / attendi / ip <attuale> <nuovo> / lampeggia <ip>` | cerca gli Shelly, attende i nuovi, assegna l'IP fisso previsto dal programma, li fa lampeggiare | no |
 | `programma scarica` | scarica dal Miniserver la versione ATTUALE del programma in `data/programmi/` | si' |
-| `programma riepilogo / cerca / blocco / pagina` | analisi della logica del programma | no |
+| `programma riepilogo / cerca / blocco / pagina` | analisi della logica: collegamenti, parametri (tempi, ritardi), ingressi invertiti; i blocchi con lo stesso titolo hanno un suffisso `#xxxx-xxxx` | no |
 | `programma parametro <blocco> --connettore K --valore V` | modifica un parametro su una COPIA | no |
 | `programma rimuovi <blocco> [<blocco>...]` | elimina blocchi e i loro collegamenti su una COPIA | no |
 | `programma confronta <nuovo> --file <vecchio>` | differenze tra due versioni del programma | no |
@@ -91,7 +91,8 @@ toccare nome rete e password. Gli IP previsti li ricava dal programma.
   vecchi. Gli strumenti usano in automatico la versione piu' recente tra scaricate e backup.
 - Nuovi blocchi e collegamenti: modulo `claudelox/editor.py` (`clone_block` da un blocco esistente dello
   stesso tipo, `insert_children` in una pagina, `add_input`, `bump_counters`, `free_area_below`;
-  `remove_blocks` per eliminare). Le modifiche ricorrenti vanno in uno script dentro `scenari/` (esempio:
+  `remove_blocks` per eliminare, `remove_input` per togliere un solo collegamento, `set_inverted` per
+  invertire o non invertire un ingresso). Le modifiche ricorrenti vanno in uno script dentro `scenari/` (esempio:
   `scenari/esempio_porta_luci.py`), che crea la copia in `data/programmi/` e stampa il confronto.
 - Per togliere un'automazione: `programma rimuovi` con TUTTI i suoi blocchi (anche gli `InputRef`/`OutputRef`
   creati apposta). Se un altro oggetto li usa ancora, il tool si ferma: decidi con l'utente.
@@ -121,6 +122,9 @@ toccare nome rete e password. Gli IP previsti li ricava dal programma.
 - `cmd_upload` fa sempre: backup della versione attiva -> confronto -> controlli (app, modifiche dall'app,
   antifurto) -> build -> (con `--applica`) upload + riavvio + verifica (il programma attivo coincide con
   quello caricato, log senza emergenza) -> ripristino automatico se qualcosa va storto. Default = prova a secco.
+- La verifica che conta e' il programma attivo (`wait_for_program`, fino a 2 minuti): il Miniserver lo rinomina
+  solo dopo averlo avviato. Il log sulla scheda viene scritto in ritardo (anche oltre un minuto), quindi serve solo
+  a scoprire emergenze o errori: se l'avvio non compare ancora, e' un avviso, non un fallimento.
 
 ### Caricamento tramite Loxone Config (computer use, verificato con Config 17.2)
 

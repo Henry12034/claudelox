@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import ftplib
 import getpass
 import io
 import json
@@ -525,7 +526,7 @@ def cmd_program(args, s):
         if not hits:
             raise LoxoneError(f"nessun blocco '{args.testo}'")
         for e in hits[:10]:
-            print(json.dumps(prog.wiring(e), ensure_ascii=False, indent=2))
+            print(json.dumps(prog.wiring(e, detailed=True), ensure_ascii=False, indent=2))
     elif args.azione == "pagina":
         if not args.testo:
             raise LoxoneError("indica il nome della pagina")
@@ -534,18 +535,34 @@ def cmd_program(args, s):
         for e in page:
             if e.tag != "C":
                 continue
-            w = prog.wiring(e)
+            w = prog.wiring(e, detailed=True)
             print(f"- {w['titolo']} <{w['tipo']}>" + (f"  formula: {w['formula']}" if "formula" in w else "")
                   + (f"  rif: {w['riferimento']}" if "riferimento" in w else ""))
+            if w.get("parametri"):
+                print("    parametri: " + ", ".join(f"{k}={v}" for k, v in w["parametri"].items()))
             for line in w["ingressi"] + w["uscite"]:
                 print(f"    {line}")
 
 
-def activation_outcome(log_text: str) -> dict:
-    """Esito dell'ultimo riavvio della logica, letto dal log (solo le righe successive al riavvio)."""
+LOG_TS_RE = re.compile(r"^\ufeff?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def activation_outcome(log_text: str, since: datetime | None = None) -> dict:
+    """Esito dell'ultimo riavvio della logica, letto dal log (solo le righe successive al riavvio).
+
+    Con `since` conta solo un riavvio registrato da quel momento in poi (riavvio_visto=False se non c'e' ancora).
+    """
     lines = log_text.splitlines()
-    start = max((i for i, ln in enumerate(lines) if "Restart SPS by user" in ln or "PRG got restart command" in ln),
-                default=max(len(lines) - 80, 0))
+
+    def recent(ln: str) -> bool:
+        m = LOG_TS_RE.match(ln)
+        return since is None or (m is not None and datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") >= since)
+
+    restarts = [i for i, ln in enumerate(lines)
+                if ("Restart SPS by user" in ln or "PRG got restart command" in ln) and recent(ln)]
+    if not restarts and since is not None:
+        return {"errori": None, "caricato": False, "avviato": False, "emergenza": False, "riavvio_visto": False}
+    start = restarts[-1] if restarts else max(len(lines) - 80, 0)
     errors, started, emergency, loaded = None, False, False, False
     for ln in lines[start:]:
         m = re.search(r"Errors:\s*(\d+)", ln)
@@ -557,7 +574,8 @@ def activation_outcome(log_text: str) -> dict:
             started = True
         if "Emergency" in ln:
             emergency = True
-    return {"errori": errors, "caricato": loaded, "avviato": started, "emergenza": emergency}
+    return {"errori": errors, "caricato": loaded, "avviato": started, "emergenza": emergency,
+            "riavvio_visto": bool(restarts)}
 
 
 def pending_app_changes(s) -> list[str]:
@@ -654,38 +672,32 @@ def cmd_upload(args, s):
         raise LoxoneError("upload FTP non verificato: interrotto prima del riavvio")
     print(f"  caricato e verificato ({res.uploaded} byte). Riavvio la logica...")
 
+    restart_at = datetime.now() - timedelta(seconds=120)  # margine per orologi di PC e Miniserver non allineati
     with Miniserver(admin).connect_admin() as ms:
         ms.restart_program()
 
-    print("  riavvio inviato, attendo che il Miniserver ricarichi...")
-    deadline = time.monotonic() + 90
-    new_active = False
-    while time.monotonic() < deadline:
-        time.sleep(5)
-        try:
-            with Miniserver(s).connect() as ms:
-                new_active = True
-                break
-        except (LoxoneError, OSError, websocket.WebSocketException):
-            continue
-    time.sleep(5)  # lascia finire compilazione e rinomina del programma
-
     # VERITA' VERA: il programma attivo sul Miniserver coincide con quello che volevo caricare?
-    matches = False
-    if new_active:
+    # (il Miniserver lo rinomina solo dopo averlo avviato; il riavvio dura circa 10 s)
+    print("  riavvio inviato, attendo che il Miniserver avvii il nuovo programma...")
+    matches = wait_for_program(s, new_prog)
+    # il log e' un controllo aggiuntivo (programma di emergenza, errori). Il Miniserver lo scrive sulla
+    # scheda con qualche secondo di ritardo: va riletto finche' non compare l'avvio dopo il riavvio
+    outcome: dict = {}
+    for _ in range(12):
         try:
-            p_after = Program(read_program(download_current_program(s))[0])
-            still = programmod.diff(new_prog, p_after)
-            matches = not (still["aggiunti"] or still["rimossi"] or still["modificati"])
-        except (LoxoneError, OSError, websocket.WebSocketException, ValueError):
-            matches = False
-    # il log e' un controllo aggiuntivo: errori di compilazione o avvio del programma di emergenza
-    log_text = uploader.ftp_download(s.host, ftp_user, ftp_pw, "/log/def.log").decode("utf-8", "replace")
-    outcome = activation_outcome(log_text)
+            log_text = uploader.ftp_download(s.host, ftp_user, ftp_pw, "/log/def.log").decode("utf-8", "replace")
+            outcome = activation_outcome(log_text, since=restart_at)
+        except (OSError, EOFError, ftplib.Error):
+            pass
+        if outcome.get("avviato") or outcome.get("emergenza"):
+            break
+        time.sleep(5)
     errs = outcome.get("errori")
     print(f"Programma attivo coincide col caricato: {matches} | log: {outcome}")
 
-    if matches and outcome.get("avviato") and not outcome.get("emergenza") and (errs is None or errs == 0):
+    if matches and not outcome.get("emergenza") and (errs is None or errs == 0):
+        if not outcome.get("avviato"):
+            warn("il log non mostra ancora l'avvio, ma il programma attivo e' quello caricato")
         print("CARICAMENTO DIRETTO RIUSCITO.")
         return
 
@@ -696,14 +708,27 @@ def cmd_upload(args, s):
     try:
         with Miniserver(admin).connect_admin() as ms:
             ms.restart_program()
-        time.sleep(15)
-        p_back = Program(read_program(download_current_program(s))[0])
-        back_ok = not any(programmod.diff(Program(cur_xml), p_back)[k] for k in ("aggiunti", "rimossi", "modificati"))
+        back_ok = wait_for_program(s, Program(cur_xml))
         print("Versione precedente ripristinata e verificata." if back_ok
               else "ATTENZIONE: ripristino inviato ma non confermato: controlla l'impianto.")
     except LoxoneError:
         print("ATTENZIONE: ripristino inviato ma non confermato: controlla l'impianto.")
     raise LoxoneError("attivazione fallita: ripristinata la versione precedente. Controlla il file e riprova.")
+
+
+def wait_for_program(s, expected: Program, seconds: float = 120) -> bool:
+    """Attende che il programma attivo sul Miniserver coincida con `expected` (riprova durante il riavvio)."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        try:
+            active = Program(read_program(download_current_program(s))[0])
+        except (LoxoneError, OSError, websocket.WebSocketException, ValueError):
+            continue  # Miniserver ancora in riavvio
+        d = programmod.diff(expected, active)
+        if not (d["aggiunti"] or d["rimossi"] or d["modificati"]):
+            return True
+    return False
 
 
 def cmd_raw(args, s):

@@ -12,6 +12,7 @@ import tempfile
 import unittest
 import zipfile
 import zlib
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -133,6 +134,16 @@ class EditorTest(unittest.TestCase):
         with self.assertRaises(editor.EditError):
             editor.remove_blocks(SAMPLE, [PAGE])
 
+    def test_remove_input_and_set_inverted(self):
+        text = editor.remove_input(SAMPLE, PULSE_IN, REF_AQ)
+        self.assertIn(f'<Co K="InputTrigger" Inv="true" U="{PULSE_IN}"/>', text)
+        text = editor.set_inverted(text, PULSE_IN, False)
+        self.assertIn(f'<Co K="InputTrigger" U="{PULSE_IN}"/>', text)
+        text = editor.add_input(editor.set_inverted(text, PULSE_IN, True), PULSE_IN, REF_AQ)
+        self.assertEqual(text.replace(" />", "/>"), SAMPLE)  # torna identico (a parte lo stile di chiusura)
+        with self.assertRaises(editor.EditError):
+            editor.remove_input(SAMPLE, PULSE_IN, OTHER_Q)  # collegamento che non esiste
+
     def test_set_parameter_changes_only_value(self):
         new = set_parameter(SAMPLE.encode("utf-8"), PULSE_TIME, "0.5").decode("utf-8")
         self.assertEqual(new, SAMPLE.replace(f'Def="0.1" U="{PULSE_TIME}"', f'Def="0.5" U="{PULSE_TIME}"'))
@@ -150,6 +161,14 @@ class ImpactTest(unittest.TestCase):
         self.assertTrue(any("stanza" in x for x in app_impact(a, b, b"{}")))
         self.assertTrue(any("stanza" in n for ch in diff(a, b)["modificati"] for n in ch["modifiche"]))
 
+    def test_inverted_input_is_reported(self):
+        a = Program(SAMPLE.encode("utf-8"))
+        b = Program(SAMPLE.replace('<Co K="InputTrigger" Inv="true"', '<Co K="InputTrigger"').encode("utf-8"))
+        notes = [n for ch in diff(a, b)["modificati"] for n in ch["modifiche"]]
+        self.assertIn("ingresso InputTrigger non piu' invertito", notes)
+        self.assertEqual(app_impact(a, b, b"{}"), [])
+        self.assertIn("InputTrigger (invertito) <- Porta", " ".join(a.wiring(a.block("Impulso"), detailed=True)["ingressi"]))
+
     def test_removing_visible_control_touches_app(self):
         a = Program(SAMPLE.encode("utf-8"))
         b = Program(editor.remove_blocks(SAMPLE, [LIGHT])[0].encode("utf-8"))
@@ -166,7 +185,12 @@ class LogTest(unittest.TestCase):
             "2026-01-01 11:00:08.100;Program started: /lx/prog/sps_0001_20260101100000.zip",
         ])
         self.assertEqual(activation_outcome(log), {"errori": None, "caricato": True, "avviato": True,
-                                                   "emergenza": False})
+                                                   "emergenza": False, "riavvio_visto": True})
+        # riga del riavvio scritta, quelle successive non ancora: non e' un fallimento ne' un successo
+        self.assertFalse(activation_outcome("\n".join(log.splitlines()[:2]))["avviato"])
+        # un riavvio vecchio non conta se si chiede solo quello dopo un certo momento
+        later = activation_outcome(log, since=datetime(2026, 1, 1, 12, 0))
+        self.assertEqual((later["riavvio_visto"], later["avviato"]), (False, False))
 
 
 if __name__ == "__main__":
