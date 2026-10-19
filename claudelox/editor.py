@@ -189,12 +189,15 @@ def _whole_lines(text: str, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 
-def _drop_links(text: str, gone: set[str]) -> str:
-    """Toglie i collegamenti <In Input=...> che partono da connettori eliminati, aggiornando Nc."""
+def _drop_links(text: str, gone: set[str], only: str | None = None) -> str:
+    """Toglie i collegamenti <In Input=...> che partono dai connettori `gone`, aggiornando Nc.
+
+    Con `only` agisce solo sul connettore di destinazione con quell'UUID.
+    """
     self_close = " />" if text.count('" />') > text.count('"/>') else "/>"
     edits = []
     for m in CO_TAG_RE.finditer(text):
-        if m.group(1):
+        if m.group(1) or (only and f'U="{only}"' not in m.group(0)):
             continue
         close = text.find("</Co>", m.end())
         body = text[m.end():close]
@@ -214,6 +217,25 @@ def _drop_links(text: str, gone: set[str]) -> str:
     for a, b, new in reversed(edits):
         text = text[:a] + new + text[b:]
     return text
+
+
+def remove_input(text: str, connector_uuid: str, source_uuid: str) -> str:
+    """Toglie un solo collegamento: quello dal connettore sorgente all'ingresso indicato."""
+    new = _drop_links(text, {source_uuid}, only=connector_uuid)
+    if new == text:
+        raise EditError(f"collegamento {source_uuid} -> {connector_uuid} non trovato")
+    return new
+
+
+def set_inverted(text: str, connector_uuid: str, inverted: bool) -> str:
+    """Rende invertito (o non piu' invertito) un ingresso: attributo Inv="true" del connettore."""
+    m = re.search(r'<Co\b[^>]*\sU="%s"[^>]*>' % re.escape(connector_uuid), text)
+    if not m:
+        raise EditError(f"connettore {connector_uuid} non trovato")
+    tag = re.sub(r'\sInv="[^"]*"', "", m.group(0))
+    if inverted:
+        tag = re.sub(r'(<Co\s+K="[^"]*")', r'\1 Inv="true"', tag, count=1)
+    return text[:m.start()] + tag + text[m.end():]
 
 
 def remove_blocks(text: str, uuids: list[str]) -> tuple[str, int]:

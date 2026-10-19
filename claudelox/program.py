@@ -64,6 +64,7 @@ class Program:
             for co in e.findall("Co"):
                 for i in co.findall("In"):
                     self.links_from[i.get("Input")].append((e, co.get("K")))
+        self._titles = collections.Counter(self.title(e) for e in self.components())
 
     def _is_private(self, e) -> bool:
         t = e.get("Type")
@@ -141,18 +142,39 @@ class Program:
         return [e for e in self.components()
                 if e.get("Type") not in ("Page",) and (q in norm(self.title(e)) or q in norm(e.get("Desc") or ""))]
 
-    def wiring(self, e) -> dict:
-        """Ingressi (da dove arrivano i segnali) e uscite (dove vanno) di un blocco."""
+    def name(self, e) -> str:
+        """Titolo, con un pezzo dell'UUID se altri oggetti del programma hanno lo stesso titolo."""
+        t = self.title(e)
+        return f"{t}#{(e.get('U') or '')[4:13]}" if self._titles[t] > 1 else t
+
+    def wiring(self, e, detailed: bool = False) -> dict:
+        """Ingressi (da dove arrivano i segnali) e uscite (dove vanno) di un blocco.
+
+        detailed=True serve a leggere la logica: titoli resi univoci, ingressi invertiti, parametri.
+        Il confronto tra versioni (diff) usa la forma semplice, stabile tra un programma e l'altro.
+        """
+        name = self.name if detailed else self.title
+
+        def inverted(block, key) -> str:
+            co = next((c for c in block.findall("Co") if c.get("K") == key), None)
+            return " (invertito)" if detailed and co is not None and co.get("Inv") == "true" else ""
+
         ins, outs = [], []
         for co in e.findall("Co"):
             for i in co.findall("In"):
                 src = self.conn_owner.get(i.get("Input"))
                 if src:
-                    ins.append(f"{co.get('K')} <- {self.title(src[0])}.{src[1]} <{src[0].get('Type')}>")
+                    ins.append(f"{co.get('K')}{inverted(e, co.get('K'))} <- {name(src[0])}.{src[1]} "
+                               f"<{src[0].get('Type')}>")
             for dst, k in self.links_from.get(co.get("U"), []):
-                outs.append(f"{co.get('K')} -> {self.title(dst)}.{k} <{dst.get('Type')}>")
-        info = {"tipo": e.get("Type"), "titolo": self.title(e), "posizione": self.path(e),
+                outs.append(f"{co.get('K')} -> {name(dst)}.{k}{inverted(dst, k)} <{dst.get('Type')}>")
+        info = {"tipo": e.get("Type"), "titolo": name(e), "posizione": self.path(e),
                 "uuid": e.get("U"), "ingressi": ins, "uscite": outs}
+        if detailed:
+            params = {co.get("K"): _shown(co.get("K"), co.get("Def")) for co in e.findall("Co")
+                      if co.get("Def") is not None}
+            if params:
+                info["parametri"] = params
         if e.get("Desc"):
             info["descrizione"] = redact(e.get("Desc"))
         if e.get("Type") == "Formula" and e.get("Formula"):
@@ -229,7 +251,8 @@ def _shown(attr: str, value: str | None):
 IODATA_NAMES = {"Pr": "stanza", "Cr": "categoria", "Visu": "visibile nell'app", "UseInFav": "tra i preferiti",
                 "IconV": "icona", "Rating": "importanza"}
 IODATA_PRIVATE = {"Ugr", "Ugx"}  # permessi dei gruppi di utenti: si segnala solo che sono cambiati
-LOGIC_ONLY = ("parametro ", "nuovo collegamento", "collegamento rimosso", "NumO:")  # NumO = contatore oggetti
+LOGIC_ONLY = ("parametro ", "nuovo collegamento", "collegamento rimosso", "ingresso ",
+              "NumO:")  # NumO = contatore oggetti
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{16}")
 
 
@@ -261,6 +284,10 @@ def _changes(a: Program, ea, b: Program, eb) -> list[str]:
     pb = {co.get("K"): co.get("Def") for co in eb.findall("Co")}
     notes += [f"parametro {k}: {pa.get(k)!r} -> {pb.get(k)!r}" for k in sorted(set(pa) | set(pb))
               if pa.get(k) != pb.get(k)]
+    inv_a = {co.get("K") for co in ea.findall("Co") if co.get("Inv") == "true"}
+    inv_b = {co.get("K") for co in eb.findall("Co") if co.get("Inv") == "true"}
+    notes += [f"ingresso {k} ora invertito" for k in sorted(inv_b - inv_a)]
+    notes += [f"ingresso {k} non piu' invertito" for k in sorted(inv_a - inv_b)]
     ins_a, ins_b = set(a.wiring(ea)["ingressi"]), set(b.wiring(eb)["ingressi"])
     notes += [f"nuovo collegamento: {x}" for x in sorted(ins_b - ins_a)]
     notes += [f"collegamento rimosso: {x}" for x in sorted(ins_a - ins_b)]
