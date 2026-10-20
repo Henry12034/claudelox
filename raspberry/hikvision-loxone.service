@@ -1,0 +1,14 @@
+[Unit]
+Description=Ponte telecamere Hikvision -> Loxone
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/hikvision-loxone/config.toml
+
+[Service]
+User=pi
+ExecStart=/usr/bin/python3 /opt/claudelox-raspberry/hikvision_loxone.py run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

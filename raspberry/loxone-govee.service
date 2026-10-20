@@ -1,0 +1,14 @@
+[Unit]
+Description=Ponte Loxone -> luci Govee via Bluetooth
+After=bluetooth.service network-online.target
+Wants=bluetooth.service network-online.target
+
+[Service]
+User=pi
+EnvironmentFile=/etc/default/loxone-govee
+ExecStart=/opt/claudelox-raspberry/venv/bin/python /opt/claudelox-raspberry/loxone_govee.py run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
