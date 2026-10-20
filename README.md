@@ -39,6 +39,9 @@ Tutto avviene **in rete locale**, con le API ufficiali documentate da Loxone. Ne
      nomi, stanze), che il caricamento diretto rifiuta.
 - **Regole di sicurezza** per Claude in `CLAUDE.md`: antifurto, porte, cancelli e finestre richiedono il tuo
   consenso esplicito per ogni singola azione; nessun caricamento ad antifurto inserito.
+- **Raspberry Pi (facoltativo)**: in `raspberry/` ci sono due piccoli servizi per cio' che Loxone non comanda
+  da solo: luci LED **Govee** via Bluetooth (il Miniserver manda comandi UDP) e telecamere **Hikvision** (gli
+  eventi attivano ingressi virtuali di Loxone). Vedi [`raspberry/README.md`](raspberry/README.md).
 
 ## Requisiti
 
@@ -143,6 +146,7 @@ lox, lox.cmd, lox.py    avvio del toolkit (Bash / PowerShell)
 claudelox/              client Miniserver (client, crypto), struttura dell'app (structure),
                         programma (loxcc, program, editor), caricamento (uploader), log, backup, Shelly, CLI
 scenari/                script di modifica riutilizzabili (esempio: porta che accende le luci)
+raspberry/              servizi per un Raspberry Pi: luci Govee via Bluetooth, telecamere Hikvision
 tests/                  test senza Miniserver:  python -m unittest discover -s tests
 CLAUDE.md               istruzioni e regole per Claude (pubbliche)
 CLAUDE.local.md         dati del tuo impianto (privato, creato al primo avvio)
@@ -155,8 +159,9 @@ smart home on the local network, using Loxone's documented WebSocket/HTTP APIs (
 It downloads the Miniserver program (the Loxone Config project XML), analyses and edits it on a copy, shows
 a readable diff, and — only with your consent — uploads it either directly (FTP + logic restart, with
 backup, verification and automatic rollback) or through Loxone Config. Safety rules for the agent live in
-`CLAUDE.md` (alarm, doors, gates and windows need explicit consent for every action). The CLI and docs are
-in Italian. Unofficial project, not affiliated with Loxone; use at your own risk.
+`CLAUDE.md` (alarm, doors, gates and windows need explicit consent for every action). Optional Raspberry Pi
+services in `raspberry/` bridge Govee Bluetooth LED strips and Hikvision camera events to the Miniserver.
+The CLI and docs are in Italian. Unofficial project, not affiliated with Loxone; use at your own risk.
 
 ## Licenza
 

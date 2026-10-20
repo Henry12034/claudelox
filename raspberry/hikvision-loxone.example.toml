@@ -1,0 +1,26 @@
+# Configurazione del ponte telecamere Hikvision -> Loxone.
+# Sul Raspberry va in /etc/hikvision-loxone/config.toml, leggibile solo dal servizio (contiene password):
+#   sudo install -d /etc/hikvision-loxone
+#   sudo install -m 0640 -g pi hikvision-loxone.example.toml /etc/hikvision-loxone/config.toml
+#   sudo nano /etc/hikvision-loxone/config.toml
+
+[miniserver]
+host = "192.168.1.10"            # IP del Miniserver
+user = ""                        # utente Loxone dedicato, con accesso agli ingressi virtuali usati
+password = ""
+# command = "SET(Sw;On;Pulse)"   # cosa scrivere nell'ingresso virtuale (predefinito)
+
+[[cameras]]
+name = "Esterna"
+host = "192.168.1.20"            # IP della telecamera
+user = ""                        # utente della telecamera
+password = ""
+
+# Una regola per ogni evento da girare a Loxone. Per vedere quali eventi, regioni e bersagli manda la
+# telecamera:  python3 /opt/claudelox-raspberry/hikvision_loxone.py eventi Esterna 120
+[[cameras.events]]
+type = "linedetection"           # attraversamento linea
+region = 1                       # facoltativo: numero della linea configurata sulla telecamera
+target = "human"                 # facoltativo: human (persone) o vehicle (veicoli)
+inputs = ["movimento_ingresso"]  # ingressi virtuali di Loxone da attivare
+# cooldown = 5                   # facoltativo: secondi minimi tra due comandi uguali
