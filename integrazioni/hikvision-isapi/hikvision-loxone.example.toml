@@ -1,0 +1,53 @@
+# Configurazione del ponte telecamere Hikvision -> Loxone.
+# Sul Raspberry va in /etc/hikvision-loxone/config.toml, leggibile solo dal servizio (contiene password):
+#   sudo install -d /etc/hikvision-loxone
+#   sudo install -m 0640 -g pi hikvision-loxone.example.toml /etc/hikvision-loxone/config.toml
+#   sudo nano /etc/hikvision-loxone/config.toml
+
+[miniserver]
+host = "192.168.1.10"            # IP del Miniserver
+user = ""                        # utente Loxone dedicato, con accesso agli ingressi virtuali usati
+password = ""
+# command = "SET(Sw;On;Pulse)"   # cosa scrivere nell'ingresso virtuale (predefinito)
+
+[[cameras]]
+name = "Esterna"
+host = "192.168.1.20"            # IP della telecamera
+user = ""                        # utente della telecamera
+password = ""
+
+# Una regola per ogni evento da girare a Loxone. Per vedere quali eventi, regioni e bersagli manda la
+# telecamera:  python3 /opt/claudelox-raspberry/hikvision_loxone.py eventi Esterna 120
+[[cameras.events]]
+type = "linedetection"           # attraversamento linea
+region = 1                       # facoltativo: numero della linea configurata sulla telecamera
+target = "human"                 # facoltativo: human (persone) o vehicle (veicoli)
+# channel = 2                    # facoltativo, per i registratori (NVR): solo gli eventi di questo canale
+inputs = ["movimento_ingresso"]  # ingressi virtuali di Loxone da attivare
+# cooldown = 5                   # facoltativo: secondi minimi tra due comandi uguali
+
+# Riconoscimento facciale di un registratore (NVR) Hikvision: volto dell'archivio riconosciuto sul canale 2.
+# Si prepara con: hikvision_loxone.py volti aggiungi / volti motore / volti confronto (vedi README).
+# [[cameras.events]]
+# type = "faceContrast"
+# channel = 2
+# person = "Mario"               # nome della persona nell'archivio dei volti
+# min_similarity = 85            # somiglianza minima in percento
+# confirmations = 2              # riconosciuto in almeno 2 foto ...
+# window = 20                    # ... entro 20 secondi
+# inputs = ["mario_entrata"]
+# cooldown = 120
+# dry_run = true                 # prova: scrive nel log cosa farebbe, senza comandare Loxone
+
+# Riconoscimento facciale sul Raspberry con le foto della telecamera (vedi README, "volti-locali impara").
+# [[cameras.events]]
+# type = "volto"
+# target = "human"               # parte quando la telecamera segnala una persona (intrusione o linea)
+# continuous = true              # oppure: analisi continua delle foto, senza aspettare gli avvisi
+# person = "Mario"
+# min_similarity = 45            # coseno in percento
+# confirmations = 2              # foto in cui deve essere riconosciuto
+# window = 8                     # secondi di foto
+# inputs = ["mario_entrata"]
+# cooldown = 120
+# dry_run = true

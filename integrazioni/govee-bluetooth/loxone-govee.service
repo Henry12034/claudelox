@@ -9,6 +9,8 @@ EnvironmentFile=/etc/default/loxone-govee
 ExecStart=/opt/claudelox-raspberry/venv/bin/python /opt/claudelox-raspberry/loxone_govee.py run
 Restart=always
 RestartSec=5
+# chiusura dei collegamenti Bluetooth: se BlueZ non risponde non si aspettano i 90 s predefiniti
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

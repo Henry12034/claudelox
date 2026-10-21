@@ -39,9 +39,11 @@ Tutto avviene **in rete locale**, con le API ufficiali documentate da Loxone. Ne
      nomi, stanze), che il caricamento diretto rifiuta.
 - **Regole di sicurezza** per Claude in `CLAUDE.md`: antifurto, porte, cancelli e finestre richiedono il tuo
   consenso esplicito per ogni singola azione; nessun caricamento ad antifurto inserito.
-- **Raspberry Pi (facoltativo)**: in `raspberry/` ci sono due piccoli servizi per cio' che Loxone non comanda
-  da solo: luci LED **Govee** via Bluetooth (il Miniserver manda comandi UDP) e telecamere **Hikvision** (gli
-  eventi attivano ingressi virtuali di Loxone). Vedi [`raspberry/README.md`](raspberry/README.md).
+- **Integrazioni** (libreria aperta, cartella [`integrazioni/`](integrazioni/)): collegamenti con dispositivi e
+  protocolli che Loxone non comanda da solo, nati in case vere e provati dal vivo: luci LED **Govee** via
+  Bluetooth, telecamere e registratori **Hikvision** (eventi, firmware, riconoscimento facciale), Shelly. Quelle
+  che girano su un Raspberry Pi si installano con [`raspberry/install.sh`](raspberry/README.md). Chi usa ClaudeLox
+  puo' aggiungere le sue: a Claude basta chiedere *"aggiungi alla libreria l'integrazione che abbiamo fatto"*.
 
 ## Requisiti
 
@@ -146,7 +148,8 @@ lox, lox.cmd, lox.py    avvio del toolkit (Bash / PowerShell)
 claudelox/              client Miniserver (client, crypto), struttura dell'app (structure),
                         programma (loxcc, program, editor), caricamento (uploader), log, backup, Shelly, CLI
 scenari/                script di modifica riutilizzabili (esempio: porta che accende le luci)
-raspberry/              servizi per un Raspberry Pi: luci Govee via Bluetooth, telecamere Hikvision
+integrazioni/           libreria aperta di collegamenti con dispositivi esterni (Govee, Hikvision...)
+raspberry/              installazione sul Raspberry Pi delle integrazioni che girano li'
 tests/                  test senza Miniserver:  python -m unittest discover -s tests
 CLAUDE.md               istruzioni e regole per Claude (pubbliche)
 CLAUDE.local.md         dati del tuo impianto (privato, creato al primo avvio)
@@ -159,8 +162,10 @@ smart home on the local network, using Loxone's documented WebSocket/HTTP APIs (
 It downloads the Miniserver program (the Loxone Config project XML), analyses and edits it on a copy, shows
 a readable diff, and — only with your consent — uploads it either directly (FTP + logic restart, with
 backup, verification and automatic rollback) or through Loxone Config. Safety rules for the agent live in
-`CLAUDE.md` (alarm, doors, gates and windows need explicit consent for every action). Optional Raspberry Pi
-services in `raspberry/` bridge Govee Bluetooth LED strips and Hikvision camera events to the Miniserver.
+`CLAUDE.md` (alarm, doors, gates and windows need explicit consent for every action). The `integrazioni/`
+folder is an open library of bridges to devices Loxone cannot drive natively (Govee Bluetooth LED strips,
+Hikvision cameras and recorders with local face recognition, Shelly), installed on a Raspberry Pi where needed;
+contributions are welcome.
 The CLI and docs are in Italian. Unofficial project, not affiliated with Loxone; use at your own risk.
 
 ## Licenza
