@@ -213,25 +213,39 @@ class GoveeBridge:
             self.pending.add(ops)
             self.wake.set()
 
-    async def run(self) -> None:
+    async def run(self, connect_lock: asyncio.Lock | None = None) -> None:
         from bleak import BleakClient, BleakScanner
+        lock = connect_lock or asyncio.Lock()
         backoff = 5
         while True:
             try:
-                device = await BleakScanner.find_device_by_address(self.address, timeout=20)
-                if device is None:
+                async with lock:      # BlueZ cerca e collega una luce alla volta ("Operation already in progress")
+                    device = await BleakScanner.find_device_by_address(self.address, timeout=20)
+                    client = BleakClient(device, timeout=20) if device else None
+                    if client:
+                        await client.connect()
+                if client is None:
                     log.warning("luce %s non trovata: spenta, troppo lontana o collegata all'app del telefono",
                                 self.address)
                 else:
-                    async with BleakClient(device, timeout=20) as client:
+                    try:
                         log.info("collegato a %s (%s)", device.name or "?", self.address)
                         backoff = 1    # caduta di un collegamento riuscito: si riprova subito
                         await self._session(client)
-                    log.warning("collegamento chiuso dalla luce")
+                        log.warning("collegamento chiuso dalla luce")
+                    finally:
+                        await self._disconnect(client)
             except Exception as e:  # Bluetooth instabile: si riprova, i comandi in attesa non si perdono
                 log.warning("collegamento non riuscito o perso: %s: %s", type(e).__name__, e)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
+    @staticmethod
+    async def _disconnect(client) -> None:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=5)
+        except Exception:     # BlueZ a volte non risponde: dopo 5 s si lascia perdere (anche all'arresto)
+            pass
 
     async def _session(self, client) -> None:
         last_sent = 0.0
@@ -282,8 +296,9 @@ async def run_bridge(s: Settings) -> None:
     # all'arresto (systemctl stop, riavvio) chiude i collegamenti Bluetooth: se restano appesi, alla
     # ripartenza la luce si scollega dopo pochi secondi
     loop.add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    connect_lock = asyncio.Lock()
     try:
-        await asyncio.gather(*(b.run() for b in bridges))
+        await asyncio.gather(*(b.run(connect_lock) for b in bridges))
     except asyncio.CancelledError:
         log.info("arresto: collegamenti Bluetooth chiusi")
 

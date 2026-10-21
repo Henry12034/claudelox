@@ -6,6 +6,9 @@ ConditionPathExists=/etc/hikvision-loxone/config.toml
 
 [Service]
 User=pi
+# /var/lib/hikvision-loxone: documenti e foto degli ultimi eventi del riconoscimento facciale
+StateDirectory=hikvision-loxone
+StateDirectoryMode=0750
 ExecStart=/usr/bin/python3 /opt/claudelox-raspberry/hikvision_loxone.py run
 Restart=always
 RestartSec=10
