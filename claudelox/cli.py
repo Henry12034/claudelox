@@ -29,7 +29,7 @@ from pathlib import Path
 
 import websocket
 
-from . import backups, editor, logs
+from . import appstructure, backups, editor, logs
 from . import program as programmod
 from . import shelly as shellymod
 from . import uploader
@@ -607,14 +607,29 @@ def cmd_upload(args, s):
     if not (d["aggiunti"] or d["rimossi"] or d["modificati"]):
         print("Nessuna differenza rispetto al programma attuale: niente da caricare.")
         return
-    # la struttura dell'app (LoxAPP3.json) la genera Loxone Config: qui resta quella attuale
+    # la struttura dell'app (LoxAPP3.json) la genera Loxone Config e il Miniserver usa quella dello zip:
+    # per le modifiche visibili nell'app la aggiorna il toolkit (appstructure), se sa farlo
     impact = programmod.app_impact(cur_prog, new_prog, cur_app)
+    new_app, replace = None, {}
     if impact:
-        print("ATTENZIONE: la modifica cambia cio' che si vede nell'app Loxone:")
+        print("La modifica cambia cio' che si vede nell'app Loxone:")
         for line in impact:
             print(f"  - {line}")
-        print("Il caricamento diretto non aggiorna la struttura dell'app: per queste modifiche usa "
-              "'lox programma apri <file>' e 'Salva nel Miniserver' in Loxone Config.")
+        perms = uploader.read_member(backup.read_bytes(), uploader.PERMISSIONS_MEMBER)
+        upd = appstructure.update_app(cur_prog, new_prog, cur_app, perms) if cur_app else None
+        if upd is None or upd.unsupported:
+            print("ATTENZIONE: il caricamento diretto non sa riportare nell'app queste modifiche:")
+            for line in (upd.unsupported if upd else ["nel programma attuale manca la struttura dell'app"]):
+                print(f"  - {line}")
+            print("Per queste usa 'lox programma apri <file>' e 'Salva nel Miniserver' in Loxone Config.")
+        else:
+            new_app, impact = upd.data, []
+            replace[uploader.APP_MEMBER] = upd.data
+            if upd.permissions is not None:
+                replace[uploader.PERMISSIONS_MEMBER] = upd.permissions
+            print("Struttura dell'app e permessi aggiornati dal toolkit (come li scriverebbe Loxone Config):")
+            for line in upd.done:
+                print(f"  + {line}")
     app_changes = pending_app_changes(s)
     if app_changes:
         print(f"ATTENZIONE: sul Miniserver ci sono {len(app_changes)} modifiche fatte dall'app (timer, scene, "
@@ -634,7 +649,7 @@ def cmd_upload(args, s):
             alarm_unknown = True
     alarm_problem = (f"antifurto '{alarm_armed}' INSERITO" if alarm_armed else
                      "stato dell'antifurto non leggibile" if alarm_unknown else None)
-    built = uploader.build_program_zip(backup.read_bytes(), new_xml)
+    built = uploader.build_program_zip(backup.read_bytes(), new_xml, replace)
     print(f"Pacchetto sps_new.zip pronto: {len(built)} byte.")
 
     if not args.applica:
@@ -698,6 +713,8 @@ def cmd_upload(args, s):
     if matches and not outcome.get("emergenza") and (errs is None or errs == 0):
         if not outcome.get("avviato"):
             warn("il log non mostra ancora l'avvio, ma il programma attivo e' quello caricato")
+        if new_app is not None:
+            check_app_structure(s, new_app)
         print("CARICAMENTO DIRETTO RIUSCITO.")
         return
 
@@ -714,6 +731,26 @@ def cmd_upload(args, s):
     except LoxoneError:
         print("ATTENZIONE: ripristino inviato ma non confermato: controlla l'impianto.")
     raise LoxoneError("attivazione fallita: ripristinata la versione precedente. Controlla il file e riprova.")
+
+
+def check_app_structure(s, app_json: bytes) -> None:
+    """Dopo un caricamento con la struttura dell'app aggiornata: e' quella che il Miniserver da' alle app?"""
+    expected = json.loads(app_json.decode("utf-8"))
+    try:
+        with open_ms(s) as ms:
+            served = ms.structure(refresh=True)
+    except (LoxoneError, OSError, websocket.WebSocketException) as e:
+        warn(f"struttura dell'app non verificata ({e})")
+        return
+    # il file nello zip usa chiavi "U:<uuid>", quello che il Miniserver da' alle app no: si confronta uuidAction
+    served_uuids = {c.get("uuidAction") for c in served.get("controls", {}).values()}
+    missing = [c["name"] for c in expected["controls"].values() if c.get("uuidAction") not in served_uuids]
+    if served.get("lastModified") != expected["lastModified"] or missing:
+        warn(f"il Miniserver non mostra la struttura caricata (ultima modifica {served.get('lastModified')}, "
+             f"mancano {missing[:5]}): salva il programma con Loxone Config")
+    else:
+        print(f"Struttura dell'app attiva: ultima modifica {served['lastModified']}, "
+              f"{len(served['controls'])} controlli (le app la scaricano da sole)")
 
 
 def wait_for_program(s, expected: Program, seconds: float = 120) -> bool:

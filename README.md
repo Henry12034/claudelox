@@ -31,17 +31,19 @@ Tutto avviene **in rete locale**, con le API ufficiali documentate da Loxone. Ne
 - **Programma**: il toolkit scarica dal Miniserver lo stesso progetto che apre Loxone Config (XML), lo
   analizza e lo modifica sempre **su una copia**, mostrando un confronto leggibile.
 - **Caricamento** (solo con il tuo consenso), in due modi:
-  1. **diretto**, senza aprire Config: il programma va sul Miniserver via FTP, la logica si riavvia (circa
-     10 secondi), poi il toolkit verifica che il programma attivo sia quello giusto e, se qualcosa va storto,
-     ripristina da solo la versione precedente;
-  2. **con Loxone Config**: Claude apre la copia in Config e (con il "computer use" di Claude) preme
-     "Salva nel Miniserver", oppure lo fai tu. Serve per le modifiche che cambiano l'app (nuovi controlli,
-     nomi, stanze), che il caricamento diretto rifiuta.
+  1. **diretto**, senza aprire Config: il programma va sul Miniserver via FTP insieme alla struttura dell'app e
+     ai permessi aggiornati (controlli nuovi, eliminati, spostati o rinominati compaiono subito nell'app), la
+     logica si riavvia (circa 10 secondi), poi il toolkit verifica che programma e app siano quelli giusti e, se
+     qualcosa va storto, ripristina da solo la versione precedente;
+  2. **con Loxone Config**, solo per i casi che il caricamento diretto non sa fare (stanze o categorie nuove,
+     controlli composti come le luci): Claude apre la copia in Config e (con il "computer use" di Claude) preme
+     "Salva nel Miniserver", oppure lo fai tu.
 - **Regole di sicurezza** per Claude in `CLAUDE.md`: antifurto, porte, cancelli e finestre richiedono il tuo
   consenso esplicito per ogni singola azione; nessun caricamento ad antifurto inserito.
 - **Integrazioni** (libreria aperta, cartella [`integrazioni/`](integrazioni/)): collegamenti con dispositivi e
   protocolli che Loxone non comanda da solo, nati in case vere e provati dal vivo: luci LED **Govee** via
-  Bluetooth, telecamere e registratori **Hikvision** (eventi, firmware, riconoscimento facciale), Shelly. Quelle
+  Bluetooth, telecamere e registratori **Hikvision** (eventi, firmware, riconoscimento facciale), sensore della
+  qualita' dell'aria **Amazon** (dal cloud Alexa), Shelly. Quelle
   che girano su un Raspberry Pi si installano con [`raspberry/install.sh`](raspberry/README.md). Chi usa ClaudeLox
   puo' aggiungere le sue: a Claude basta chiedere *"aggiungi alla libreria l'integrazione che abbiamo fatto"*.
 
@@ -49,8 +51,9 @@ Tutto avviene **in rete locale**, con le API ufficiali documentate da Loxone. Ne
 
 - Un Miniserver Loxone raggiungibile in rete locale (testato: Miniserver Gen 2, firmware 17.2).
 - Python 3.10 o successivo (testato con 3.13) e Claude Code.
-- Loxone Config su Windows, solo per creare l'utente dedicato e per le modifiche che cambiano l'app.
-  Lettura, comandi, analisi e caricamento diretto funzionano anche da macOS e Linux.
+- Loxone Config su Windows, solo per creare l'utente dedicato e per le poche modifiche dell'app che il
+  caricamento diretto non sa fare. Lettura, comandi, analisi e caricamento diretto funzionano anche da macOS e
+  Linux.
 
 ## Installazione
 
@@ -133,9 +136,10 @@ L'elenco completo e le regole che Claude segue sono in `CLAUDE.md`; `.\lox.cmd -
 
 ## Limiti noti
 
-- Il caricamento diretto non aggiorna la struttura dell'app (`LoxAPP3.json`, che genera Loxone Config):
-  vale solo per modifiche alla logica (parametri, collegamenti, blocchi non visibili nell'app). Il comando
-  `carica` riconosce le altre modifiche e chiede di usare Config.
+- Il caricamento diretto aggiorna la struttura dell'app (`LoxAPP3.json`) e i permessi (`permissions.bin`), che di
+  solito genera Loxone Config, copiando controlli dello stesso tipo gia' presenti: stanze o categorie nuove,
+  controlli composti (luci, intercom, antifurto) e tipi di controllo che l'app non ha ancora restano a Config. Il
+  comando `carica` riconosce questi casi e si ferma.
 - Le modifiche fatte dall'app (timer, scene, Autopilot) restano sul Miniserver finche' Config non le integra
   nel programma; caricare un programma via FTP le cancellerebbe, quindi `carica` in quel caso si ferma.
 - Testato su un solo impianto (Gen 2, firmware 17.2). Altri modelli e firmware dovrebbero funzionare per
@@ -145,10 +149,10 @@ L'elenco completo e le regole che Claude segue sono in `CLAUDE.md`; `.\lox.cmd -
 
 ```
 lox, lox.cmd, lox.py    avvio del toolkit (Bash / PowerShell)
-claudelox/              client Miniserver (client, crypto), struttura dell'app (structure),
+claudelox/              client Miniserver (client, crypto), struttura dell'app (structure, appstructure),
                         programma (loxcc, program, editor), caricamento (uploader), log, backup, Shelly, CLI
-scenari/                script di modifica riutilizzabili (esempio: porta che accende le luci)
-integrazioni/           libreria aperta di collegamenti con dispositivi esterni (Govee, Hikvision...)
+scenari/                script di modifica riutilizzabili (porta che accende le luci, sensore dell'aria Amazon)
+integrazioni/           libreria aperta di collegamenti con dispositivi esterni (Govee, Hikvision, Amazon...)
 raspberry/              installazione sul Raspberry Pi delle integrazioni che girano li'
 tests/                  test senza Miniserver:  python -m unittest discover -s tests
 CLAUDE.md               istruzioni e regole per Claude (pubbliche)
@@ -161,10 +165,12 @@ ClaudeLox lets [Claude Code](https://claude.com/claude-code) monitor, control an
 smart home on the local network, using Loxone's documented WebSocket/HTTP APIs (encrypted login, tokens).
 It downloads the Miniserver program (the Loxone Config project XML), analyses and edits it on a copy, shows
 a readable diff, and — only with your consent — uploads it either directly (FTP + logic restart, with
-backup, verification and automatic rollback) or through Loxone Config. Safety rules for the agent live in
-`CLAUDE.md` (alarm, doors, gates and windows need explicit consent for every action). The `integrazioni/`
+backup, verification and automatic rollback; the app structure `LoxAPP3.json` and `permissions.bin` are
+updated too, so new or moved controls show up in the app) or through Loxone Config. Safety rules for the agent
+live in `CLAUDE.md` (alarm, doors, gates and windows need explicit consent for every action). The `integrazioni/`
 folder is an open library of bridges to devices Loxone cannot drive natively (Govee Bluetooth LED strips,
-Hikvision cameras and recorders with local face recognition, Shelly), installed on a Raspberry Pi where needed;
+Hikvision cameras and recorders with local face recognition, the Amazon Smart Air Quality Monitor via the Alexa
+cloud, Shelly), installed on a Raspberry Pi where needed;
 contributions are welcome.
 The CLI and docs are in Italian. Unofficial project, not affiliated with Loxone; use at your own risk.
 

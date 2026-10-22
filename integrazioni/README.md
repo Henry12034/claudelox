@@ -9,6 +9,7 @@ proprie**: piu' case, piu' dispositivi, una libreria sempre piu' grande.
 |---|---|---|---|---|---|
 | [govee-bluetooth](govee-bluetooth/) | Govee H6126 (firmware 2.06.1) | Bluetooth LE (GATT) | Loxone comanda le strisce LED: accensione, luminosita', colore, scene; piu' strisce insieme | Raspberry Pi | stabile |
 | [hikvision-isapi](hikvision-isapi/) | registratore DS-7608NXI-I2/S (V4.62), telecamera DS-2CD2347G2H-LI (V5.7.13-V5.7.23) | HTTP ISAPI (digest), RTSP | eventi delle telecamere -> ingressi virtuali di Loxone; ora, firmware, luce notturna, archivio volti; **riconoscimento facciale sul Raspberry** (OpenCV) | Raspberry Pi | eventi: stabile; volti: sperimentale |
+| [amazon-alexa](amazon-alexa/) | Amazon Smart Air Quality Monitor | cloud Alexa (aioamazondevices) | valori del sensore della qualita' dell'aria (PM2.5, PM10, VOC, CO, umidita', temperatura) -> ingresso virtuale HTTP di Loxone | Raspberry Pi | sperimentale |
 | Shelly (nel toolkit) | Shelly Gen1 e Gen2 | HTTP locale | cerca gli Shelly, assegna l'IP fisso previsto dal programma, li fa lampeggiare: `lox shelly` ([codice](../claudelox/shelly.py)) | PC | stabile |
 
 Per installare quelle che girano sul Raspberry: [`raspberry/`](../raspberry/).

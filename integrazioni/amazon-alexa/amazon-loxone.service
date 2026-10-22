@@ -1,0 +1,20 @@
+[Unit]
+Description=Ponte sensore aria Amazon (cloud Alexa) -> Loxone
+After=network-online.target
+Wants=network-online.target
+# parte solo dopo l'accesso ad Amazon (amazon_loxone.py accedi)
+ConditionPathExists=/var/lib/amazon-loxone/accesso.json
+
+[Service]
+User=pi
+EnvironmentFile=/etc/default/amazon-loxone
+# /var/lib/amazon-loxone: dati di accesso ad Amazon, leggibili solo dall'utente del servizio
+StateDirectory=amazon-loxone
+StateDirectoryMode=0700
+ExecStart=/opt/claudelox-raspberry/venv/bin/python /opt/claudelox-raspberry/amazon_loxone.py run
+Restart=always
+# a ogni avvio il ponte chiede ad Amazon l'elenco dei dispositivi: niente ripartenze a raffica
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

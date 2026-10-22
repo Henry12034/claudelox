@@ -77,29 +77,57 @@ def element_span(text: str, uuid: str) -> tuple[int, int]:
     raise EditError(f"oggetto {uuid} non chiuso correttamente")
 
 
+def _set_attrs(attrs: dict[str, str], changes: dict[str, str | None] | None) -> None:
+    for k, v in (changes or {}).items():
+        if v is None:
+            attrs.pop(k, None)
+        else:
+            attrs[k] = v
+
+
 def clone_block(template, ids: UuidFactory, *, title: str | None = None, position: tuple[int, int] | None = None,
-                overrides: dict[str, dict] | None = None) -> tuple[str, str, dict[str, str]]:
+                overrides: dict[str, dict] | None = None, attrs: dict[str, str | None] | None = None,
+                elements: dict[str, dict[str, str | None]] | None = None,
+                children: list[str] | None = None) -> tuple[str, str, dict[str, str]]:
     """Testo XML di un nuovo blocco copiato da un blocco esistente (ElementTree).
 
     overrides: {nome_connettore: {"inputs": [uuid,...], "Inv": True|False, "Def": "valore"|None}}.
+    attrs: altri attributi del blocco da cambiare ({nome: valore}, None toglie l'attributo).
+    elements: se indicato, copia anche gli elementi del modello che non sono connettori ne' blocchi
+      (IoData con stanza e categoria, Display con l'unita'...), con gli attributi da cambiare, es.
+      {"IoData": {"Pr": uuid_stanza, "IconV": None}}; senza, quegli elementi non si copiano.
+    children: blocchi gia' pronti (testo XML) da mettere dentro il nuovo blocco, in fondo.
+    I blocchi contenuti nel modello non si copiano mai.
     Restituisce (testo, uuid_blocco, {nome_connettore: uuid_connettore}).
     """
     overrides = overrides or {}
     block_u = ids.block()
-    attrs = dict(template.attrib)
-    attrs["U"] = block_u
+    new_attrs = dict(template.attrib)
+    new_attrs["U"] = block_u
     if title is not None:
-        attrs["Title"] = title
-    if position is not None and all(k in attrs for k in LAYOUT):
-        w = int(attrs["Px2"]) - int(attrs["Px"])
-        h = int(attrs["Py2"]) - int(attrs["Py"])
+        new_attrs["Title"] = title
+    if position is not None and all(k in new_attrs for k in LAYOUT):
+        w = int(new_attrs["Px2"]) - int(new_attrs["Px"])
+        h = int(new_attrs["Py2"]) - int(new_attrs["Py"])
         x, y = position
-        attrs.update(Px=str(x), Py=str(y), Px2=str(x + w), Py2=str(y + h))
-    if "LtE" in attrs:
-        attrs["LtE"] = str(ids.stamp)
-    lines = ["<C " + " ".join(f'{k}="{escape_attr(v)}"' for k, v in attrs.items()) + ">"]
+        new_attrs.update(Px=str(x), Py=str(y), Px2=str(x + w), Py2=str(y + h))
+    if "LtE" in new_attrs:
+        new_attrs["LtE"] = str(ids.stamp)
+    _set_attrs(new_attrs, attrs)
+    lines = ["<C " + " ".join(f'{k}="{escape_attr(v)}"' for k, v in new_attrs.items()) + ">"]
     connectors: dict[str, str] = {}
-    for i, co in enumerate(template.findall("Co")):
+    i = -1
+    for co in template:
+        if co.tag != "Co":
+            if co.tag != "C" and elements is not None:
+                if len(co) or (co.text or "").strip():
+                    raise EditError(f"elemento <{co.tag}> con contenuto: non si copia")
+                el_attrs = dict(co.attrib)
+                _set_attrs(el_attrs, elements.get(co.tag))
+                lines.append(f"\t<{co.tag}" + "".join(f' {k}="{escape_attr(v)}"' for k, v in el_attrs.items())
+                             + " />")
+            continue
+        i += 1
         k = co.get("K")
         ov = overrides.get(k, {})
         cu = ids.connector(block_u, i)
@@ -125,6 +153,7 @@ def clone_block(template, ids: UuidFactory, *, title: str | None = None, positio
             lines.append("\t</Co>")
         else:
             lines.append("\t<Co " + " ".join(parts) + " />")
+    lines += ["\t" + line for child in children or [] for line in child.split("\n")]
     lines.append("</C>")
     return "\n".join(lines), block_u, connectors
 

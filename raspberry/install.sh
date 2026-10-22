@@ -4,12 +4,13 @@
 #   govee-bluetooth   luci LED Govee via Bluetooth            (config: /etc/default/loxone-govee)
 #   hikvision-isapi   telecamere e registratori Hikvision,     (config: /etc/hikvision-loxone/config.toml)
 #                     anche riconoscimento facciale sul Raspberry
-# Uso, dalla cartella del repository:  sudo raspberry/install.sh [govee-bluetooth] [hikvision-isapi]
+#   amazon-alexa      sensore della qualita' dell'aria Amazon  (config: /etc/default/amazon-loxone)
+# Uso, dalla cartella del repository:  sudo raspberry/install.sh [govee-bluetooth] [hikvision-isapi] [amazon-alexa]
 set -euo pipefail
 cd "$(dirname "$0")/../integrazioni"
 [ "$(id -u)" -eq 0 ] || { echo "esegui con sudo"; exit 1; }
 DEST=/opt/claudelox-raspberry
-[ $# -gt 0 ] || set -- govee-bluetooth hikvision-isapi
+[ $# -gt 0 ] || set -- govee-bluetooth hikvision-isapi amazon-alexa
 install -d -o pi -g pi "$DEST"
 
 install_govee() {
@@ -55,10 +56,32 @@ install_hikvision() {
   fi
 }
 
+# versione della libreria provata: Amazon cambia spesso le sue interfacce, si aggiorna dopo una prova
+AIOAMAZONDEVICES=16.9.0
+
+install_amazon() {
+  apt-get install -y python3-venv >/dev/null
+  install -m 0755 -o pi -g pi amazon-alexa/amazon_loxone.py "$DEST/"
+  [ -x "$DEST/venv/bin/python" ] || sudo -u pi python3 -m venv "$DEST/venv"
+  sudo -u pi "$DEST/venv/bin/pip" install --quiet "aioamazondevices==$AIOAMAZONDEVICES"
+  [ -f /etc/default/amazon-loxone ] || install -m 0644 amazon-alexa/amazon-loxone.env.example /etc/default/amazon-loxone
+  install -d -m 0700 -o pi -g pi /var/lib/amazon-loxone
+  install -m 0644 amazon-alexa/amazon-loxone.service /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable amazon-loxone.service >/dev/null
+  if [ -f /var/lib/amazon-loxone/accesso.json ]; then
+    systemctl restart amazon-loxone.service
+    echo "amazon-loxone: $(systemctl is-active amazon-loxone)   log: journalctl -u amazon-loxone -f"
+  else
+    echo "Sensore aria Amazon: $DEST/venv/bin/python $DEST/amazon_loxone.py accedi && sudo systemctl restart amazon-loxone"
+  fi
+}
+
 for nome in "$@"; do
   case "$nome" in
     govee-bluetooth) install_govee ;;
     hikvision-isapi) install_hikvision ;;
+    amazon-alexa) install_amazon ;;
     *) echo "integrazione sconosciuta: $nome (vedi integrazioni/README.md)"; exit 1 ;;
   esac
 done

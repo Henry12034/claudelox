@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from .loxcc import MAGIC, decompress
 
 PROGRAM_MEMBER = "sps0.LoxCC"
+APP_MEMBER = "LoxAPP3.json"
+PERMISSIONS_MEMBER = "permissions.bin"
 UPLOAD_NAME = "sps_new.zip"
 FTP_DIR = "/prog"
 
@@ -52,22 +54,30 @@ def compress_loxcc(xml: bytes) -> bytes:
     return out
 
 
-def build_program_zip(source_zip: bytes, new_xml: bytes) -> bytes:
+def build_program_zip(source_zip: bytes, new_xml: bytes, replace: dict[str, bytes] | None = None) -> bytes:
     """Ricostruisce lo zip del programma sostituendo sps0.LoxCC con new_xml compresso.
 
-    Gli altri membri (LoxAPP3.json, permissions.bin, Emergency.LoxCC, Music.json) restano
-    com'erano: il Miniserver rigenera la struttura dell'app quando compila il programma.
+    Il Miniserver NON rigenera la struttura dell'app ne' i permessi: usa LoxAPP3.json e permissions.bin
+    dello zip. `replace` sostituisce questi membri (vedi appstructure); gli altri (Emergency.LoxCC,
+    Music.json...) restano com'erano.
     """
+    replace = replace or {}
     with zipfile.ZipFile(io.BytesIO(source_zip)) as zin:
         names = zin.namelist()
-        if PROGRAM_MEMBER not in names:
-            raise ValueError(f"{PROGRAM_MEMBER} assente nello zip di partenza: {names}")
+        missing = [n for n in [PROGRAM_MEMBER, *replace] if n not in names]
+        if missing:
+            raise ValueError(f"{', '.join(missing)} assente nello zip di partenza: {names}")
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
             for name in names:
-                data = compress_loxcc(new_xml) if name == PROGRAM_MEMBER else zin.read(name)
+                data = compress_loxcc(new_xml) if name == PROGRAM_MEMBER else replace.get(name) or zin.read(name)
                 zout.writestr(name, data)
     return out.getvalue()
+
+
+def read_member(zip_bytes: bytes, name: str) -> bytes | None:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        return z.read(name) if name in z.namelist() else None
 
 
 def _tls_ctx() -> ssl.SSLContext:
