@@ -8,6 +8,7 @@ scelte, ognuna come servizio systemd che riparte da solo.
 |---|---|---|
 | [govee-bluetooth](../integrazioni/govee-bluetooth/) | `loxone-govee` | `/etc/default/loxone-govee` |
 | [hikvision-isapi](../integrazioni/hikvision-isapi/) | `hikvision-loxone` | `/etc/hikvision-loxone/config.toml` |
+| [amazon-alexa](../integrazioni/amazon-alexa/) | `amazon-loxone` | `/etc/default/amazon-loxone` |
 
 ## Preparare il Raspberry
 
@@ -30,7 +31,8 @@ scelte, ognuna come servizio systemd che riparte da solo.
 
 - programmi: `/opt/claudelox-raspberry` (con `venv/` per il Bluetooth e `modelli/` per il riconoscimento facciale);
 - configurazioni: `/etc/default/loxone-govee`, `/etc/hikvision-loxone/config.toml` (password: 0640, root e
-  gruppo `pi`);
-- dati: `/var/lib/hikvision-loxone` (impronte dei volti, ritagli dei volti riconosciuti, copie di impostazioni).
+  gruppo `pi`), `/etc/default/amazon-loxone`;
+- dati: `/var/lib/hikvision-loxone` (impronte dei volti, ritagli dei volti riconosciuti, copie di impostazioni),
+  `/var/lib/amazon-loxone` (dati di accesso ad Amazon, solo per l'utente del servizio).
 
-Log: `journalctl -u loxone-govee -f` e `journalctl -u hikvision-loxone -f`.
+Log: `journalctl -u loxone-govee -f`, `journalctl -u hikvision-loxone -f`, `journalctl -u amazon-loxone -f`.
