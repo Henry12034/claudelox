@@ -294,6 +294,31 @@ def _changes(a: Program, ea, b: Program, eb) -> list[str]:
     return notes
 
 
+def alarm_sensors_only(a: Program, ea, b: Program, eb) -> bool:
+    """Antifurto (Alarm): Objects cambia solo perche' si tolgono sensori che la finestra di configurazione del blocco
+    collegava agli ingressi nascosti (HI1-HI4), e una presenza resta collegata come prima. E' una modifica della sola
+    logica: LoxAPP3.json non elenca sensori e luci della configurazione e il record dei permessi contiene solo
+    blocco, connettori e stati (verificato il 25/10/2026). Le luci d'allarme (alert) non si possono togliere cosi'."""
+    if ea.get("Type") != "Alarm" or eb.get("Type") != "Alarm":
+        return False
+    before = {u for u in (ea.get("Objects") or "").split(",") if u}
+    after = {u for u in (eb.get("Objects") or "").split(",") if u}
+    removed = before - after
+    if not removed or after - before:
+        return False
+    hidden = set()
+    for co in ea.findall("Co"):
+        if (co.get("K") or "").startswith("HI"):
+            for i in co.findall("In"):
+                owner = a.conn_owner.get(i.get("Input"))
+                if owner and owner[0].get("Type") == "InputRef":
+                    hidden.add(owner[0].get("Ref"))
+
+    def presence(e) -> bool:
+        return any(co.findall("In") for co in e.findall("Co") if co.get("K") in ("I1", "HI1"))
+    return removed <= hidden and presence(ea) == presence(eb)
+
+
 def diff(a: Program, b: Program) -> dict:
     ua = {e.get("U"): e for e in a.components() if e.get("U")}
     ub = {e.get("U"): e for e in b.components() if e.get("U")}
@@ -323,7 +348,8 @@ def app_impact(a: Program, b: Program, app_json: bytes | None) -> list[str]:
     for u in sorted(ua.keys() & ub.keys()):
         if not (u in in_app or _visible(ua[u]) or _visible(ub[u])):
             continue
-        visual = [n for n in _changes(a, ua[u], b, ub[u]) if not n.startswith(LOGIC_ONLY)]
+        visual = [n for n in _changes(a, ua[u], b, ub[u]) if not n.startswith(LOGIC_ONLY)
+                  and not (n.startswith("Objects:") and alarm_sensors_only(a, ua[u], b, ub[u]))]
         if visual:
             out.append(f"{b.label(ub[u])}: {'; '.join(visual)}")
     return out

@@ -191,6 +191,70 @@ class ImpactTest(unittest.TestCase):
         self.assertTrue(any("eliminato" in x for x in app_impact(a, b, b"{}")))
 
 
+# antifurto con un sensore scelto nella finestra di configurazione (collegamento nascosto su HI1 e voce in Objects)
+# e una luce d'allarme (solo in Objects)
+ALARM, A_I1, A_HI1, SENSOR, SENSOR_Q, SREF, SREF_AI, SREF_AQ, LAMP = (U(i) for i in range(60, 69))
+ALARM_SAMPLE = f"""<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1" NextObj="100">
+\t<C Type="Document" U="{U(0)}" Title="Prova" NumO="5">
+\t\t<C Type="LoxLIVE" U="{U(20)}" Title="Miniserver">
+\t\t\t<C Type="TreeSensor" U="{SENSOR}" Title="movimento Sala">
+\t\t\t\t<Co K="Q" U="{SENSOR_Q}"/>
+\t\t\t</C>
+\t\t</C>
+\t\t<C Type="Page" U="{PAGE}" Title="Generale">
+\t\t\t<C Type="InputRef" U="{SREF}" Title="movimento Sala Rilevatore" Ref="{SENSOR}">
+\t\t\t\t<Co K="AI" Nc="1" U="{SREF_AI}">
+\t\t\t\t\t<In Input="{SENSOR_Q}"/>
+\t\t\t\t</Co>
+\t\t\t\t<Co K="AQ" U="{SREF_AQ}"/>
+\t\t\t</C>
+\t\t\t<C Type="Memory" U="{U(17)}" Title="Presenza in due stanze">
+\t\t\t\t<Co K="Q" U="{OTHER_Q}"/>
+\t\t\t</C>
+\t\t\t<C Type="LightController2" U="{LAMP}" Title="Luci"/>
+\t\t\t<C Type="Alarm" U="{ALARM}" Title="Antifurto" Objects="{SENSOR},{LAMP}">
+\t\t\t\t<Co K="I1" Nc="1" U="{A_I1}">
+\t\t\t\t\t<In Input="{OTHER_Q}"/>
+\t\t\t\t</Co>
+\t\t\t\t<Co K="HI1" Nc="1" U="{A_HI1}">
+\t\t\t\t\t<In Input="{SREF_AQ}" FLG="1"/>
+\t\t\t\t</Co>
+\t\t\t\t<IoData Visu="true"/>
+\t\t\t</C>
+\t\t</C>
+\t</C>
+</ControlList>
+"""
+ALARM_APP = json.dumps({"rooms": {}, "cats": {}, "controls": {f"U:{ALARM}": {
+    "name": "Antifurto", "type": "Alarm", "uuidAction": ALARM, "details": {"presenceConnected": True},
+    "states": {}}}}).encode("utf-8")
+
+
+class AlarmObjectsTest(unittest.TestCase):
+    """Togliere dall'antifurto i sensori della finestra di configurazione e' una modifica della sola logica."""
+
+    def setUp(self):
+        self.a = Program(ALARM_SAMPLE.encode("utf-8"))
+        text = editor.remove_input(ALARM_SAMPLE, A_HI1, SREF_AQ)
+        self.senza_sensore = text.replace(f'Objects="{SENSOR},{LAMP}"', f'Objects="{LAMP}"')
+
+    def update(self, text):
+        return appstructure.update_app(self.a, Program(text.encode("utf-8")), ALARM_APP)
+
+    def test_sensore_tolto(self):
+        b = Program(self.senza_sensore.encode("utf-8"))
+        self.assertEqual(app_impact(self.a, b, ALARM_APP), [])
+        up = self.update(self.senza_sensore)
+        self.assertEqual((up.unsupported, up.done), ([], []))
+
+    def test_luce_d_allarme_o_nessuna_presenza(self):
+        senza_luce = ALARM_SAMPLE.replace(f'Objects="{SENSOR},{LAMP}"', f'Objects="{SENSOR}"')
+        self.assertEqual(self.update(senza_luce).unsupported, ["'Antifurto' <Alarm>: cambiano Objects"])
+        nessuna_presenza = editor.remove_input(self.senza_sensore, A_I1, OTHER_Q)
+        self.assertEqual(self.update(nessuna_presenza).unsupported, ["'Antifurto' <Alarm>: cambiano Objects"])
+
+
 # programma con un ingresso virtuale HTTP e due valori visibili nell'app (cucina e bagno), con la struttura e i
 # permessi come li scrive Config: ogni valore lo vedono un utente e i gruppi della sua stanza e della categoria
 HTTP_IN, CMD, CMD_AQ, CMD_Q, CAT, ROOM2, ICON = U(30), U(31), U(32), U(33), U(34), U(35), U(36)

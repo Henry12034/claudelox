@@ -114,7 +114,15 @@ libreria seguendo `integrazioni/README.md` e `integrazioni/_modello/README.md`:
   invertire o non invertire un ingresso; con `elements=` copia anche `IoData` e `Display`, con `children=` mette
   blocchi dentro un altro, es. i comandi di un ingresso virtuale). Le modifiche ricorrenti vanno in uno script
   dentro `scenari/` (esempi: `scenari/esempio_porta_luci.py`, `scenari/aria_amazon.py` per un ingresso
-  virtuale HTTP con valori visibili nell'app), che crea la copia in `data/programmi/` e stampa il confronto.
+  virtuale HTTP con valori visibili nell'app, `scenari/antifurto_assistente.py` per un antifurto che scatta con la
+  conferma di un assistente esterno o dopo un ritardo di riserva), che crea la copia in `data/programmi/` e stampa
+  il confronto.
+- Antifurto (`Alarm`): nel file gli ingressi I1-I5 sono Presenza, Vetri, Finestre, Porte, Altro; HI1-HI4 gli stessi
+  tipi per i sensori scelti nella finestra di configurazione del blocco (collegamenti nascosti `FLG="1"` da
+  `InputRef` creati da Config, e i sensori anche nell'attributo `Objects`, con le luci d'allarme). Scattano senza
+  ritardo: per toglierne uno vanno tolti collegamento e voce in `Objects`, se no Config lo ricrea.
+- Un ingresso virtuale di testo collegato all'ingresso API di un pulsante si preme con
+  `jdev/sps/io/<nome>/SET(Sw;On;Pulse)` ("Loxone API Commands"); dopo il comando il testo torna vuoto.
 - Per togliere un'automazione: `programma rimuovi` con TUTTI i suoi blocchi (anche gli `InputRef`/`OutputRef`
   creati apposta). Se un altro oggetto li usa ancora, il tool si ferma: decidi con l'utente.
 - Un ingresso "Reset" va comandato con un impulso (blocco `OnPulseDelay`, Time 0.1) e non con un livello,
@@ -150,7 +158,9 @@ libreria seguendo `integrazioni/README.md` e `integrazioni/_modello/README.md`:
   - la struttura che il Miniserver manda alle app ha chiavi senza `U:`: si confronta per `uuidAction`
     (`check_app_structure`, dopo ogni caricamento).
   - non gestiti (allora `carica` si ferma e indica Config): tipi di controllo senza un modello nell'app, controlli
-    composti (luci, intercom, antifurto), stanze o categorie nuove, visibilita' solo tra i preferiti.
+    composti (luci, intercom, antifurto), stanze o categorie nuove, visibilita' solo tra i preferiti. Eccezione
+    (`program.alarm_sensors_only`, verificato il 25/10/2026): togliere dall'antifurto sensori della configurazione
+    (`Objects`) e' solo logica, se resta collegata una presenza come prima e le luci d'allarme non cambiano.
 - **Limiti** (`carica` li controlla e si ferma): le modifiche fatte dall'app (timer, scene, Autopilot...) stanno in
   `/prog/custom` finche' Config non le integra, e il caricamento di un nuovo programma le cancella.
 - `cmd_upload` fa sempre: backup della versione attiva -> confronto -> controlli (app, modifiche dall'app,

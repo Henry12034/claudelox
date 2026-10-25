@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .program import UUID_RE, Program
+from .program import UUID_RE, Program, alarm_sensors_only
 
 UNIT_RE = re.compile(r"<v(?:\.(\d))?>")
 # attributi dei blocchi che contano solo per la logica, non per l'app
@@ -305,6 +305,8 @@ class _Updater:
             self.unsupported.append(f"{label}: cambia la visibilita' nell'app")
             return
         attrs = {k for k in set(ea.attrib) | set(eb.attrib) if ea.get(k) != eb.get(k)} - LOGIC_ATTRS
+        if "Objects" in attrs and alarm_sensors_only(self.old, ea, self.new, eb):
+            attrs.discard("Objects")   # sensori tolti dalla configurazione dell'antifurto: solo logica
         io_changes = {k for k in set(ia) | set(ib) if ia.get(k) != ib.get(k)}
         relevant = attrs - {"Title", "StatsType"} | (io_changes - IODATA_HANDLED)
         da, db = ea.find("Display"), eb.find("Display")
