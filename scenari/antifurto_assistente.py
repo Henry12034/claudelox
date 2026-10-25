@@ -20,7 +20,9 @@ Cosa cambia (tutto nella pagina dell'antifurto, nessun controllo nuovo nell'app)
     --conferma -> pulsante "<assistente> conferma allarme" -> ingresso "Altro" dell'antifurto: allarme subito;
     --annulla  -> pulsante "<assistente> annulla allarme" -> annulla i ritardi della presenza e della porta.
     L'assistente li preme con jdev/sps/io/<nome>/SET(Sw;On;Pulse) (comando dei "Loxone API Commands" per l'ingresso
-    API del pulsante, lo stesso del ponte delle telecamere).
+    API del pulsante, lo stesso del ponte delle telecamere). Quel comando lascia il pulsante acceso: come gli altri
+    pulsanti comandati da fuori, un ritardo "(rilascio)" lo rimette a zero dopo 1 s. Su un programma modificato
+    da una versione precedente dello script, senza rilascio, lo script aggiunge solo quello.
 Se l'assistente e' spento, la presenza fa scattare l'allarme dopo il ritardo e la porta dopo il suo ritardo di sempre.
 Gli altri ingressi diretti (finestre, vetri, sabotaggio di un dispositivo) restano come sono: lo script li elenca.
 
@@ -105,6 +107,40 @@ def modelli(prog: Program):
     return vti, ref, dest
 
 
+def rilascio(modello, ids: editor.UuidFactory, titolo: str, posizione: tuple[int, int], uscita: str):
+    """Il blocco che rimette a zero un pulsante comandato da fuori. SET(Sw;On;Pulse) accende il pulsante e lo lascia
+    acceso (misurato il 25/10/2026): nel programma ogni pulsante cosi' ha un ritardo che, 1 s dopo, gli manda un
+    impulso di 0,5 s sul Reset. Si copia da un OnPulseDelay qualsiasi (il ritardo della porta)."""
+    return editor.clone_block(modello, ids, title=f"{titolo} (rilascio)", position=posizione,
+                              overrides={"InputTrigger": {"inputs": [uscita], "Inv": False}, "Reset": {"inputs": []},
+                                         "Delay": {"Def": "1"}, "Time": {"Def": "0.5"}})
+
+
+def aggiorna_pulsanti(text: str, prog: Program, pagina, modello, pulsanti: list) -> tuple[str, int]:
+    """Programmi gia' modificati da una versione precedente dello script: i pulsanti senza rilascio lo ricevono e
+    perdono la memoria (Remanence), che i modelli hanno: un pulsante rimasto acceso ripartirebbe acceso dopo un
+    riavvio, e il rilascio scatta solo quando si accende."""
+    ids = editor.UuidFactory(text)
+    x, y = editor.free_area_below(pagina)
+    blocchi, link, modifiche = [], [], 0
+    for k, p in enumerate(pulsanti):
+        rem = next((c for c in p.findall("Co") if c.get("K") == "Remanence"), None)
+        if rem is not None and rem.get("Inv") == "true":
+            text = editor.set_inverted(text, rem.get("U"), False)
+            modifiche += 1
+        if fonti(prog, p, "Reset"):
+            continue
+        xml, _, co = rilascio(modello, ids, p.get("Title"), (x, y + k * 960), connettore(p, "Q"))
+        blocchi.append(xml)
+        link.append((connettore(p, "Reset"), co["Q"]))
+    if blocchi:
+        text = editor.insert_children(text, pagina.get("U"), blocchi)
+        for reset, q in link:
+            text = editor.add_input(text, reset, q)
+        text = editor.bump_counters(text, len(blocchi))
+    return text, modifiche + len(blocchi)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--assistente", default="Assistente", help="nome dell'assistente nei titoli dei pulsanti")
@@ -134,17 +170,27 @@ def main() -> None:
     xml, app_json = read_program(src)
     text = xml.decode("utf-8")
     prog = Program(xml)
-    if any(e.get("Title") in (titolo_conferma, titolo_annulla, TITOLO_RITARDO) for e in prog.components()):
-        raise SystemExit("La modifica e' gia' presente in questo programma.")
-    if any(e.get("Type") == "VirtualTextIn" and e.get("Title") in (args.conferma, args.annulla)
-           for e in prog.components()):
-        raise SystemExit("Nel programma c'e' gia' un ingresso virtuale con quel nome.")
-
     allarme = [e for e in prog.components() if e.get("Type") == "Alarm" and e.get("Title") == args.antifurto]
     if len(allarme) != 1:
         raise SystemExit(f"ERRORE: blocco antifurto '{args.antifurto}' non trovato (o piu' d'uno)")
     allarme = allarme[0]
     pagina = prog.parent[allarme]
+    pulsanti = [e for e in prog.components() if e.get("Type") == "PushButton"
+                and e.get("Title") in (titolo_conferma, titolo_annulla)]
+    if pulsanti or any(e.get("Title") == TITOLO_RITARDO for e in prog.components()):
+        # gia' modificato: una versione precedente dello script non metteva il rilascio dei pulsanti
+        porta = fonti(prog, allarme, "I4")
+        if len(pulsanti) != 2 or len(porta) != 1:
+            raise SystemExit("La modifica e' gia' presente in questo programma (ma non completa: controlla a mano).")
+        text, modifiche = aggiorna_pulsanti(text, prog, pagina, porta[0][0], pulsanti)
+        if not modifiche:
+            raise SystemExit("La modifica e' gia' presente in questo programma.")
+        salva(src, prog, text.encode("utf-8"), app_json, base,
+              "Pulsanti dell'assistente aggiornati: rilascio dopo 1 s, senza memoria dopo un riavvio.")
+        return
+    if any(e.get("Type") == "VirtualTextIn" and e.get("Title") in (args.conferma, args.annulla)
+           for e in prog.components()):
+        raise SystemExit("Nel programma c'e' gia' un ingresso virtuale con quel nome.")
     presenze = fonti(prog, allarme, "I1")          # ingresso "Presenza" (P)
     nascoste = fonti(prog, allarme, "HI1")         # presenze scelte nella configurazione del blocco: senza ritardo
     porte = fonti(prog, allarme, "I4")             # ingresso "Porte" (Dc): il ritardo d'ingresso
@@ -164,7 +210,7 @@ def main() -> None:
     ids = editor.UuidFactory(text)
     vti_n = max((int(n) for n in re.findall(r'\bIName="VTI(\d+)"', text)), default=0) + 1
     x, y = editor.free_area_below(pagina)
-    nuovi_vti, nuovi_pagina, uscite = [], [], {}
+    nuovi_vti, nuovi_pagina, uscite, rilasci = [], [], {}, []
     for k, (nome, titolo) in enumerate(((args.conferma, titolo_conferma), (args.annulla, titolo_annulla))):
         vti_xml, vti_u, vti_co = editor.clone_block(vti_t, ids, title=nome, attrs={"IName": f"VTI{vti_n + k}"},
                                                      elements={"IoData": {"Pr": None, "Cr": None, "Visu": None}})
@@ -175,11 +221,13 @@ def main() -> None:
         puls_xml, _, puls_co = editor.clone_block(
             puls_t, ids, title=titolo, position=(x + 2688, y + k * 1440 - 192), attrs={"SpStates": stati},
             overrides={"OutputAPI": {"inputs": [ref_co["AQ"]]}, "Reset": {"inputs": []},
-                       "InputTrigger": {"inputs": []}, "On": {"inputs": []}},
+                       "InputTrigger": {"inputs": []}, "On": {"inputs": []}, "Remanence": {"Inv": False}},
             elements={"IoData": {"Visu": None, "Pr": None}})
+        ril_xml, _, ril_co = rilascio(ritardo_porta, ids, titolo, (x + 4416, y + k * 1440), puls_co["Q"])
         nuovi_vti.append(vti_xml)
-        nuovi_pagina += [ref_xml, puls_xml]
+        nuovi_pagina += [ref_xml, puls_xml, ril_xml]
         uscite[titolo] = puls_co["Q"]
+        rilasci.append((puls_co["Reset"], ril_co["Q"]))
     rit_xml, _, rit_co = editor.clone_block(
         ritardo_porta, ids, title=TITOLO_RITARDO, position=(x + 6144, y),
         overrides={"InputTrigger": {"inputs": [u for _, _, u in presenze], "Inv": False},
@@ -195,6 +243,8 @@ def main() -> None:
     text = editor.add_input(text, i1, rit_co["Q"])
     text = editor.add_input(text, i5, uscite[titolo_conferma])
     text = editor.add_input(text, connettore(ritardo_porta, "Reset"), uscite[titolo_annulla])
+    for reset, q in rilasci:
+        text = editor.add_input(text, reset, q)
     text = editor.bump_counters(text, len(nuovi_vti) + len(nuovi_pagina))
     # le presenze nascoste: via il collegamento, la voce della configurazione (se no Config li ricrea) e il
     # riferimento che la configurazione aveva messo nella pagina, se non serve ad altro
@@ -218,24 +268,35 @@ def main() -> None:
     for e in new_prog.components():
         if e.get("Title") in (titolo_conferma, titolo_annulla, TITOLO_RITARDO):
             assert new_prog.parent[e].get("U") == pagina.get("U"), "blocco finito fuori dalla pagina"
+        if e.get("Title") in (titolo_conferma, titolo_annulla) and e.get("Type") == "PushButton":
+            assert [o.get("Title") for o, _, _ in fonti(new_prog, e, "Reset")] == [f"{e.get('Title')} (rilascio)"]
+            assert all(c.get("Inv") != "true" for c in e.findall("Co") if c.get("K") == "Remanence"), "memoria"
     dup = [u for u in ids.used if text.count(f'U="{u}"') > 1]
     if dup:
         raise SystemExit(f"ERRORE: UUID duplicati {dup}")
 
+    righe = [f"Presenza ({', '.join(o.get('Title') for o, _, _ in presenze)}) -> '{TITOLO_RITARDO}' "
+             f"({args.ritardo} s) -> antifurto; '{ritardo_porta.get('Title')}' annullabile; "
+             f"segnali: {args.conferma} (conferma), {args.annulla} (annulla)"]
+    if nascoste:
+        righe.append("Tolte dall'antifurto (scattavano senza ritardo): "
+                     + ", ".join(descrivi(prog, o) for o, _, _ in nascoste))
+    diretti = [(k, o) for k in ("I2", "I3", "HI2", "HI3", "HI4") for o, _, _ in fonti(new_prog, nuovo_allarme, k)]
+    if diretti:
+        righe.append("Restano senza ritardo: "
+                     + "; ".join(f"{INGRESSI[k]}: {descrivi(new_prog, o)}" for k, o in diretti))
+    salva(src, prog, new_xml, app_json, base, "\n".join(righe))
+
+
+def salva(src: Path, prog: Program, new_xml: bytes, app_json, base: str, riassunto: str) -> None:
+    """Scrive la copia in data/programmi e stampa il confronto con la partenza."""
+    new_prog = Program(new_xml)  # il file deve restare XML valido
     out = DATA_DIR / "programmi" / f"{src.stem}-antifurto-{base}-{datetime.now():%Y%m%d-%H%M}.Loxone"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(new_xml)
     d = diff(prog, new_prog)
     print(f"Partenza: {src.name}\nCopia modificata: {out}")
-    print(f"Presenza ({', '.join(o.get('Title') for o, _, _ in presenze)}) -> '{TITOLO_RITARDO}' "
-          f"({args.ritardo} s) -> antifurto; '{ritardo_porta.get('Title')}' annullabile; "
-          f"segnali: {args.conferma} (conferma), {args.annulla} (annulla)")
-    if nascoste:
-        print("Tolte dall'antifurto (scattavano senza ritardo): "
-              + ", ".join(descrivi(prog, o) for o, _, _ in nascoste))
-    diretti = [(k, o) for k in ("I2", "I3", "HI2", "HI3", "HI4") for o, _, _ in fonti(new_prog, nuovo_allarme, k)]
-    if diretti:
-        print("Restano senza ritardo: " + "; ".join(f"{INGRESSI[k]}: {descrivi(new_prog, o)}" for k, o in diretti))
+    print(riassunto)
     print(f"Aggiunti: {len(d['aggiunti'])}  Rimossi: {len(d['rimossi'])}  Modificati: {len(d['modificati'])}")
     for a in d["aggiunti"]:
         print(f"  + {a}")

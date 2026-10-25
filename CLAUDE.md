@@ -122,7 +122,12 @@ libreria seguendo `integrazioni/README.md` e `integrazioni/_modello/README.md`:
   `InputRef` creati da Config, e i sensori anche nell'attributo `Objects`, con le luci d'allarme). Scattano senza
   ritardo: per toglierne uno vanno tolti collegamento e voce in `Objects`, se no Config lo ricrea.
 - Un ingresso virtuale di testo collegato all'ingresso API di un pulsante si preme con
-  `jdev/sps/io/<nome>/SET(Sw;On;Pulse)` ("Loxone API Commands"); dopo il comando il testo torna vuoto.
+  `jdev/sps/io/<nome>/SET(Sw;On;Pulse)` ("Loxone API Commands"); dopo il comando il testo torna vuoto. ATTENZIONE
+  (misurato il 25/10/2026): il comando ACCENDE il pulsante e lo lascia acceso; per questo ogni pulsante cosi' ha un
+  `OnPulseDelay` (Delay 1, Time 0.5) dalla sua uscita al suo Reset. I `PushButton` hanno anche la memoria
+  (`Remanence` con `Inv="true"`): uno rimasto acceso riparte acceso dopo un riavvio. Copiandone uno, metti il
+  rilascio e togli la memoria (vedi `scenari/antifurto_assistente.py`). Un pulsante visibile (es. di prova) si
+  osserva con lo stato `active`; uno non visibile non manda stati.
 - Per togliere un'automazione: `programma rimuovi` con TUTTI i suoi blocchi (anche gli `InputRef`/`OutputRef`
   creati apposta). Se un altro oggetto li usa ancora, il tool si ferma: decidi con l'utente.
 - Un ingresso "Reset" va comandato con un impulso (blocco `OnPulseDelay`, Time 0.1) e non con un livello,
