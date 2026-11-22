@@ -12,7 +12,9 @@ quando scopri qualcosa di stabile sull'impianto (nuove logiche, dispositivi, pro
 
 **Primo avvio.** Se manca `.env` o `./lox ping` segnala che manca il login, guida l'utente nei passi del
 README ("Installazione"): utente dedicato in Loxone Config, `.env`, `lox login` (la password la digita
-l'utente in un terminale, mai in chat).
+l'utente in un terminale, mai in chat). Guarda il firmware che riporta `lox ping`: il toolkit e' stato provato
+con il 17.2 e il 17.3 su un Miniserver Gen 2. Con un altro modello o firmware dillo all'utente, comincia dalle
+letture (`salute`, `programma scarica`) e prima di un caricamento fai sempre la prova a secco.
 
 ## Eseguire il toolkit
 
@@ -34,6 +36,7 @@ l'utente in un terminale, mai in chat).
 | `backup` | backup di Loxone Config sul PC | no |
 | `dispositivi` | dispositivi esterni del programma (Shelly, Raspberry, meteo): raggiungibili? quale modello? | no |
 | `shelly trova / attendi / ip <attuale> <nuovo> / lampeggia <ip>` | cerca gli Shelly, attende i nuovi, assegna l'IP fisso previsto dal programma, li fa lampeggiare | no |
+| `shelly wifi [--ordine 224,225] [--prova]` | procedura guidata col telefono Android via adb: ricollega al Wi-Fi gli Shelly resettati, con l'IP previsto | no |
 | `programma scarica` | scarica dal Miniserver la versione ATTUALE del programma in `data/programmi/` | si' |
 | `programma riepilogo / cerca / blocco / pagina` | analisi della logica: collegamenti, parametri (tempi, ritardi), ingressi invertiti; i blocchi con lo stesso titolo hanno un suffisso `#xxxx-xxxx` | no |
 | `programma parametro <blocco> --connettore K --valore V` | modifica un parametro su una COPIA | no |
@@ -48,17 +51,29 @@ l'utente in un terminale, mai in chat).
 Un controllo si indica per nome, "Stanza/Nome" o UUID; un blocco del programma per titolo o UUID. Se il nome
 e' ambiguo il tool elenca i candidati: scegli con `--stanza` o con l'UUID, senza tirare a indovinare.
 
-Shelly: la password del Wi-Fi la inserisce sempre l'utente (pagina 192.168.33.1 dello Shelly o app Shelly).
-Dopo, `shelly ip` imposta l'IP fisso via API locale (Gen1 `/settings/sta`, Gen2 `WiFi.SetConfig`) senza
-toccare nome rete e password. Gli IP previsti li ricava dal programma.
+Shelly: la password del Wi-Fi la inserisce sempre l'utente, mai in chat. Strada preferita: `shelly wifi`, avviata
+dall'utente con doppio clic su un file `.cmd` del Desktop (chiede la password due volte, senza mostrarla, e la tiene
+solo in memoria). Un telefono Android collegato via USB (debug USB) cerca le reti di configurazione `shelly*`, si
+collega (`cmd wifi connect-network`), parla con lo Shelly su 192.168.33.1 con `curl --interface wlan0` (indirizzo e
+dati dallo standard input, mai sulla riga di comando) e gli manda rete e IP fisso previsto dal programma (Gen1
+`/settings/sta`, Gen2 `WiFi.SetConfig`, poi spegne la sua rete aperta); poi lo ritrova in casa e, se e' una luce, lo
+fa lampeggiare (prese e rele' no: toglierebbe corrente a cio' che e' collegato; `shelly lampeggia --forza` se serve).
+Il tipo (luce, sensore, presa) decide l'IP; `--ordine` sceglie quale lampadina prende quale indirizzo. Registro in
+`data/shelly-wifi.log`. Reset: lampadine Gen1 = 5 accensioni e spegnimenti a ~5 s; Motion = tasto 5 s (rete di
+configurazione, impostazioni tenute) o 10 s (reset); Plug S = tasto 10 s entro un minuto dall'accensione. Senza
+telefono: pagina 192.168.33.1 o app Shelly, poi `shelly ip` imposta l'IP fisso senza toccare nome rete e password.
 
 ## Regole di sicurezza (obbligatorie)
 
 1. **Azioni sulla casa.** Se l'utente chiede esplicitamente un'azione ("spegni le luci del bagno"),
    eseguila e riporta lo stato prima/dopo. Se l'azione l'hai dedotta tu, chiedi prima.
-2. **Controlli di sicurezza** (antifurto, intercom e porte, cancelli, finestre: vedi `SENSITIVE_TYPES` in
-   `claudelox/structure.py`). Serve il consenso esplicito in chat per ogni singola azione; solo allora usa
-   `--conferma`.
+2. **Controlli di sicurezza** (antifurto, intercom e porte, cancelli, finestre). Serve il consenso esplicito in
+   chat per ogni singola azione; solo allora usa `--conferma`. Il toolkit li riconosce da se'
+   (`Structure.sensitive_reason` in `claudelox/structure.py`: tipi di sicurezza e loro sotto-controlli, come
+   l'apriporta di un intercom; nomi come "Apri cancello", "Serratura", "Sirena"; controlli scelti dall'utente in
+   `LOXONE_PROTETTI` nel `.env`) e `lox controlli` li segna `[SICUREZZA]`. Molti impianti aprono porta o cancello
+   con un pulsante dal nome qualunque: se ne trovi uno non segnato, trattalo comunque come di sicurezza e proponi
+   all'utente di aggiungerlo a `LOXONE_PROTETTI`. Non usare `raw` per aggirare la protezione.
 3. **Comandi di sistema.** `raw --conferma` (riavvio, aggiornamento firmware, reset, rete, utenti) solo su
    richiesta esplicita dell'utente, dopo aver spiegato l'effetto.
 4. **Segreti.** Non leggere, stampare o copiare `.env`, `.state/`, ne' i campi con password, utenti, chiavi o
@@ -112,11 +127,26 @@ libreria seguendo `integrazioni/README.md` e `integrazioni/_modello/README.md`:
   stesso tipo, `insert_children` in una pagina, `add_input`, `bump_counters`, `free_area_below`;
   `remove_blocks` per eliminare, `remove_input` per togliere un solo collegamento, `set_inverted` per
   invertire o non invertire un ingresso; con `elements=` copia anche `IoData` e `Display`, con `children=` mette
-  blocchi dentro un altro, es. i comandi di un ingresso virtuale). Le modifiche ricorrenti vanno in uno script
+  blocchi dentro un altro, es. i comandi di un ingresso virtuale; `clone_group` copia una logica intera, blocchi di
+  stato compresi, con i collegamenti interni rifatti tra le copie). Le modifiche ricorrenti vanno in uno script
   dentro `scenari/` (esempi: `scenari/esempio_porta_luci.py`, `scenari/aria_amazon.py` per un ingresso
   virtuale HTTP con valori visibili nell'app, `scenari/antifurto_assistente.py` per un antifurto che scatta con la
-  conferma di un assistente esterno o dopo un ritardo di riserva), che crea la copia in `data/programmi/` e stampa
-  il confronto.
+  conferma di un assistente esterno o dopo un ritardo di riserva, `scenari/luci_scene_govee.py` per scene Govee
+  come atmosfere di un controllo luci, `scenari/riordina_app.py` per riordinare l'app da un piano JSON privato in
+  `data/`, `scenari/avviso_ping.py` per avvisare quando un dispositivo di rete non risponde, copiando una logica
+  Ping con notifiche gia' presente), che crea la copia in `data/programmi/` e stampa il confronto. Attributi e IoData
+  si cambiano con `editor.set_block_attr` e `editor.set_iodata` (solo l'IoData del blocco, non quello dei blocchi
+  contenuti); altri elementi del blocco (es. il testo `On` di `LoggerMailer`) con `editor.set_child_attr`.
+- Nome nell'app = descrizione del blocco (`Desc`) se c'e', altrimenti `Title` (es. "Luci_sala" si vede "Sala/cucina").
+  Un blocco e' nell'app con `Visu="true"` e una stanza o categoria, oppure solo tra i preferiti (`UseInFav="true"`
+  senza Visu); per nasconderlo vanno tolti `Visu` e `UseInFav` (Config non scrive `Visu="false"`).
+- Controllo luci (`LightController2`): circuiti negli attributi `NameAI0`... (sotto-controlli `<uuid>/AI1`... nell'app),
+  atmosfere in `<LightscenesC Num=..>` / `<LightsceneC Name SID CID Q1..Qn>` (SID = numero dell'atmosfera, quello
+  dell'uscita `Scene`; 778 = Off, 777 = tutto acceso; CID contatore per controllo; Qn = tipo << 28 | valore, tipo
+  1 = dimmer 0-100, 4 = RGB BBBGGGRRR). Le atmosfere non sono in LoxAPP3.json: l'app le chiede al Miniserver
+  (stato `moodList`), quindi aggiungerle e' solo logica. Un blocco di stato con `Input0="1" CondV0="n" CondT0="n"`
+  scrive un testo quando I1 = n; un comando di uscita virtuale `<v>` (Analog, Tx) che lo riceve manda "0" quando
+  il testo torna vuoto.
 - Antifurto (`Alarm`): nel file gli ingressi I1-I5 sono Presenza, Vetri, Finestre, Porte, Altro; HI1-HI4 gli stessi
   tipi per i sensori scelti nella finestra di configurazione del blocco (collegamenti nascosti `FLG="1"` da
   `InputRef` creati da Config, e i sensori anche nell'attributo `Objects`, con le luci d'allarme). Scattano senza
@@ -147,6 +177,41 @@ libreria seguendo `integrazioni/README.md` e `integrazioni/_modello/README.md`:
   contenuto non compresso**; poi blocco LZ4. `compress_loxcc` usa LZ4 store-mode (verificato col round-trip).
 - FTP: Pure-FTPd con TLS esplicito sulla porta 21; l'utente scrive su `/prog`. Il riavvio (`dev/sps/restart`)
   richiede Sys-WS (0x100): l'uploader lo ottiene con `connect_admin()` e verifica i diritti PRIMA di caricare.
+  Dal firmware 16.1 l'FTP e' spento per impostazione predefinita (si attiva in Config, proprieta' del Miniserver,
+  solo TLS): `carica` controlla che risponda e altrimenti si ferma spiegandolo.
+- Caricando lo zip il Miniserver ne mette i pezzi al loro posto: `permissions.bin`, `Emergency.LoxCC` e
+  `Music.json` in `/prog`, `LoxAPP3.json` in `/web/data`.
+- **Dopo un aggiornamento del firmware** (misurato il 21/11/2026, da 17.2.8 a 17.3.11, nel log "Start Auto
+  Update", poi "Save program done") il Miniserver converte il programma e lo salva DA SE' come
+  `sps_XXXX_<data>.LoxCC`, non come zip: ci mette dentro le modifiche fatte dall'app e riscrive `LoxAPP3.json` e
+  `permissions.bin` (stesso formato di Config, byte per byte). `programma scarica` in quel caso ricompone lo zip
+  completo dai file separati (`uploader.pack_program`, percorsi in `COMPANION_FILES`), cosi' il resto del toolkit
+  lavora come sempre. La struttura rigenerata dal firmware elenca anche i controlli senza `Visu` che sono
+  collegati a un controllo luci (`linkC`) o usati da una regola Autopilot: quelli nascosti dal toolkit ricompaiono.
+- **Elenco dei file** (`Miniserver.list_files`): fino al 17.2 `dev/fslist/<cartella>` risponde via WebSocket con un
+  JSON; dal 17.3 via WebSocket arriva sempre vuoto (qualsiasi diritto del token), mentre lo stesso percorso via
+  HTTP con `autht` da' un elenco di testo (`d|-  dimensione  data  nome`, "Directory empty" se vuota o
+  inesistente). Il toolkit prova il WebSocket e poi HTTP. `dev/fsget/<percorso>` via HTTP funziona su entrambi.
+- **Formato del programma**: l'attributo `LxAV` della radice `ControlList` cambia con il firmware (87 sul 17.2,
+  88 sul 17.3) e la conversione aggiunge oggetti e attributi. Una copia preparata prima di un aggiornamento, o
+  una versione vecchia da ripristinare, resta nel formato precedente: `carica` confronta `LxAV` e si ferma
+  (`format_mismatch`). Dopo un aggiornamento del firmware le modifiche in sospeso vanno rifatte partendo da
+  `programma scarica` (gli script di `scenari/` servono a questo).
+- Se il caricamento si interrompe prima del riavvio della logica (FTP caduto, dimensione non verificata, login
+  admin fallito) `carica` toglie `/prog/sps_new.zip`: lasciato li', il Miniserver lo caricherebbe al riavvio
+  successivo. Lo toglie anche dopo un ripristino, se il Miniserver non lo aveva consumato.
+- **Caricamento reale sul 17.3: verificato il 22/11/2026** (17.3.11.12, andata e ritorno su un parametro di un
+  blocco senza uscite): il Miniserver legge `sps_new.zip` e lo rinomina `sps_XXXX_<data>.zip` come sul 17.2, con la
+  logica ferma circa 5 s; tornando alla versione di partenza programma, struttura dell'app e permessi attivi sono
+  identici byte per byte. Effetti del riavvio: `/sys/custom` si svuota; un controllo luci senza atmosfera attiva
+  (dimmer collegato al master) puo' ripartire mostrando la scena "Tanta luce", con la stessa luminosita'.
+  Il ripristino AUTOMATICO dopo un errore e' scattato davvero solo sul 17.2.
+- La prova che un caricamento e' partito e' `wait_for_program`: `sps_new.zip` consumato E programma attivo uguale
+  a quello atteso. Il solo confronto non basta (in un ripristino il file piu' recente e' gia' quello giusto).
+- `carica` si ferma nel dubbio: antifurto inserito, in allarme, in fase di inserimento, con stato non leggibile o
+  non visibile all'utente (`alarm_block_reason`); elenco di `/prog` o `/sys/custom` non leggibile; un pezzo del
+  pacchetto che non si scarica; utenti o permessi diversi (`program.access_changes`: solo Config). Il confronto
+  mostra anche gli elementi interni dei blocchi (testi delle notifiche, unita', regole di stato) e oscura i segreti.
 - **Struttura dell'app e permessi** (`claudelox/appstructure.py`, verificato dal vivo il 22/10/2026): Config
   genera `LoxAPP3.json` e `permissions.bin` e il Miniserver usa quelli dello zip senza ricalcolarli. `carica` li
   aggiorna da se':
@@ -162,14 +227,27 @@ libreria seguendo `integrazioni/README.md` e `integrazioni/_modello/README.md`:
     dagli altri controlli che stanno li'.
   - la struttura che il Miniserver manda alle app ha chiavi senza `U:`: si confronta per `uuidAction`
     (`check_app_structure`, dopo ogni caricamento).
-  - non gestiti (allora `carica` si ferma e indica Config): tipi di controllo senza un modello nell'app, controlli
-    composti (luci, intercom, antifurto), stanze o categorie nuove, visibilita' solo tra i preferiti. Eccezione
-    (`program.alarm_sensors_only`, verificato il 25/10/2026): togliere dall'antifurto sensori della configurazione
-    (`Objects`) e' solo logica, se resta collegata una presenza come prima e le luci d'allarme non cambiano.
-- **Limiti** (`carica` li controlla e si ferma): le modifiche fatte dall'app (timer, scene, Autopilot...) stanno in
-  `/prog/custom` finche' Config non le integra, e il caricamento di un nuovo programma le cancella.
+  - controlli luci (LightControllerV2, verificato dal vivo il 07/11/2026): nome, stanza, categoria, preferito,
+    importanza, nomi dei circuiti e oggetti collegati (`linkC` -> `links`); i collegamenti a controlli nascosti o
+    tolti spariscono da `links`. Nascondere qualsiasi controllo (anche composto, anche se era solo tra i
+    preferiti) lo toglie dall'app e dai permessi.
+  - non gestiti (allora `carica` si ferma e indica Config): tipi di controllo senza un modello nell'app, altri
+    controlli composti (intercom, antifurto) cambiati, circuiti aggiunti o tolti, stanze o categorie nuove, passaggi
+    da visibile a solo-preferiti. Una categoria senza altri controlli non ha un gruppo di permessi noto: spostarci
+    un controllo non si puo'. Eccezione (`program.alarm_sensors_only`, verificato il 25/10/2026): togliere
+    dall'antifurto sensori della configurazione (`Objects`) e' solo logica, se resta collegata una presenza come
+    prima e le luci d'allarme non cambiano.
+  - per rimettere nell'app un controllo nascosto serve un controllo dello stesso tipo (e blocco) ancora visibile
+    da copiare, altrimenti Config.
+- **Limiti** (`carica` li controlla e si ferma): le modifiche fatte dall'app (atmosfere, orari, regole...) stanno in
+  `/sys/custom` (misurato il 22/11/2026: un file `<uuid>.LoxCC` per oggetto, con l'oggetto intero) finche' Config
+  o un salvataggio del firmware non le integrano, e il caricamento di un nuovo programma le cancella ("Remove old
+  custom changes"). `pending_app_changes` conta solo i file piu' recenti del programma attuale e diversi
+  dall'oggetto che il programma contiene (`program.custom_change`: non contano `V`, `WF`, `SpStates`, alba e
+  tramonto di `HCL`, l'ordine dei collegamenti). Li' stanno anche i telefoni registrati per le notifiche push
+  (`PuDe`): non bloccano il caricamento, `carica` avvisa che si registrano di nuovo quando si riapre l'app.
 - `cmd_upload` fa sempre: backup della versione attiva -> confronto -> controlli (app, modifiche dall'app,
-  antifurto) -> struttura dell'app e permessi -> build -> (con `--applica`) upload + riavvio + verifica (il
+  FTP attivo, antifurto) -> struttura dell'app e permessi -> build -> (con `--applica`) upload + riavvio + verifica (il
   programma attivo coincide con quello caricato, log senza emergenza, struttura servita alle app) -> ripristino
   automatico se qualcosa va storto. Default = prova a secco.
 - La verifica che conta e' il programma attivo (`wait_for_program`, fino a 2 minuti): il Miniserver lo rinomina
@@ -206,8 +284,15 @@ Solo quando `carica` non basta e l'utente e' d'accordo: preferisce il caricament
 - `LightControllerV2`: `changeTo/<id>`, `addMood/<id>`, `removeMood/<id>`, `plus`, `minus`. Gli id delle
   scene si leggono con `./lox mostra "<nome>"`: non darli per scontati (di solito 778 = "Off" e
   777 = "tutto acceso"; il "moodID 0" della documentazione non vale).
+- `ColorPickerV2` (circuito colore di un controllo luci, `<uuid>/AI<n>`): `hsv(<0-360>,<0-100>,<0-100>)`.
 - `LightsceneRGB`: `on`, `off`, `<numero scena>`. `CentralLightController`: `on`, `reset`.
 - `TextInput`: `<testo>`. `InfoOnly*` e `TextState`: sola lettura.
+- `Intercom` (telecamere di terzi, blocco `Doorcontroller` + `IntercomDevice` sotto Miniserver > Intercom con
+  `IntVideoUrl`, `ExtVideoUrl`, `IntAlertImage`): nella struttura `videoInfo`/`audioInfo` sono vuoti per scelta di
+  Loxone (indirizzi e credenziali stanno nei `securedDetails`: non leggerli). Le foto della cronologia
+  (`lastBellEvents`) si scaricano con `Miniserver.http_download("camimage/<uuidAction>/<timestamp>")` SENZA `.jpg`
+  (con l'estensione della documentazione: 404, firmware 17). Requisiti Loxone per le telecamere: flusso MJPEG
+  (`multipart/x-mixed-replace`) o JPEG, al massimo 5 MB per immagine, autenticazione Basic o Digest MD5.
 - Per altri tipi consulta il PDF ufficiale "Structure File" di Loxone.
 
 ## Server MCP ufficiale Loxone (alternativa, opzionale)

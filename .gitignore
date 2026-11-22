@@ -2,9 +2,12 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # credenziali, token e cache: privati
 .env
+.env.*
+!.env.example
 .state/
 
 # dati del singolo impianto: privati
@@ -15,4 +18,14 @@ CLAUDE.local.md
 data/
 *.Loxone
 *.LoxCC
+*.LoxPLAN
 sps_*.zip
+permissions.bin
+LoxAPP3.json
+def.log
+
+# file del sistema operativo e degli editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
