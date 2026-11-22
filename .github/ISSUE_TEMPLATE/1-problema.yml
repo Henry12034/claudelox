@@ -1,0 +1,46 @@
+name: Qualcosa non funziona
+description: Un comando, un caricamento o un'integrazione non fa quello che dovrebbe
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Questa pagina e' pubblica.** Non allegare programmi (`.Loxone`, `.zip`), log completi, `CLAUDE.local.md`,
+        indirizzi, coordinate, numeri di serie, nomi utente o password.
+  - type: input
+    id: miniserver
+    attributes:
+      label: Miniserver
+      description: Modello e firmware (li mostra `lox ping`)
+      placeholder: Miniserver Gen 2, 17.3.11.12
+    validations:
+      required: true
+  - type: input
+    id: sistema
+    attributes:
+      label: Computer
+      description: Sistema operativo e versione di Python
+      placeholder: Windows 11, Python 3.13
+    validations:
+      required: true
+  - type: textarea
+    id: azione
+    attributes:
+      label: Cosa hai fatto
+      description: Il comando lanciato o la richiesta fatta a Claude
+    validations:
+      required: true
+  - type: textarea
+    id: risultato
+    attributes:
+      label: Cosa e' successo e cosa ti aspettavi
+      description: Incolla il messaggio di errore, togliendo eventuali dati personali
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: Ho controllato che qui non ci siano dati della mia casa
+          required: true

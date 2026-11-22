@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Problema di sicurezza
+    url: https://github.com/Henry12034/claudelox/security/advisories/new
+    about: Segnalalo in privato, non in una segnalazione pubblica.

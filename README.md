@@ -1,5 +1,8 @@
 # ClaudeLox: la tua casa Loxone gestita da Claude Code
 
+[![Test](https://github.com/Henry12034/claudelox/actions/workflows/test.yml/badge.svg)](https://github.com/Henry12034/claudelox/actions/workflows/test.yml)
+[![Licenza MIT](https://img.shields.io/badge/licenza-MIT-blue.svg)](LICENSE)
+
 Con ClaudeLox chiedi a [Claude Code](https://claude.com/claude-code), in chat e con parole tue, di controllare e
 programmare il tuo impianto **Loxone**: Claude legge lo stato della casa, invia comandi, ti spiega il programma
 che di solito apri in Loxone Config e, se sei d'accordo, lo modifica, lo prova, lo carica sul Miniserver e
@@ -200,8 +203,9 @@ sicurezza, riscaldamento o carichi importanti.
   del programma: provati con i firmware 17.2 e 17.3, compreso il ritorno a una versione precedente. Il ripristino
   automatico dopo un errore e' scattato davvero solo sul 17.2. Su altri modelli e firmware va provato con prudenza:
   comincia con un parametro di un blocco che non comanda nulla.
-- Ogni caricamento riavvia la logica per qualche secondo: un controllo luci senza atmosfera attiva puo' ripartire
-  mostrando nell'app la scena "Tanta luce", con la stessa luminosita'.
+- Ogni caricamento riavvia la logica per qualche secondo e **alcune luci possono cambiare**: un controllo luci con il
+  dimmer collegato alla luminosita' generale puo' ripartire sulla scena "Tanta luce", anche se era spento. `carica`
+  elenca le luci cambiate e il comando per rimetterle: meglio caricare quando sei in casa.
 - Una cartella del toolkit per ogni Miniserver: i programmi scaricati in `data/` non distinguono gli impianti.
 - Il caricamento diretto aggiorna la struttura dell'app (`LoxAPP3.json`) e i permessi (`permissions.bin`), che di
   solito genera Loxone Config, copiando controlli dello stesso tipo gia' presenti: stanze o categorie nuove,
@@ -243,10 +247,11 @@ Sono benvenuti:
 - **scenari** riutilizzabili in [`scenari/`](scenari/) (script che preparano una modifica ricorrente);
 - correzioni e traduzioni.
 
-Prima di aprire una segnalazione o una richiesta di modifica controlla di non allegare dati della tua casa
-(programmi, log, `CLAUDE.local.md`, indirizzi, nomi utente). I test si eseguono senza Miniserver:
-`python -m unittest discover -s tests`. Se trovi un problema di sicurezza del toolkit, apri una segnalazione
-**senza i dettagli** e chiedi un contatto privato.
+**Come si contribuisce:** fai una copia del progetto (*Fork*), prepari la modifica e apri una *Pull Request*; i test
+girano in automatico e il manutentore decide se integrarla. Passi e regole sono in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Per un problema o per raccontare una prova usa le [segnalazioni](https://github.com/Henry12034/claudelox/issues/new/choose),
+senza allegare dati della tua casa (programmi, log, `CLAUDE.local.md`, indirizzi, nomi utente). I problemi di sicurezza
+si segnalano in privato: vedi [`SECURITY.md`](SECURITY.md).
 
 ## Struttura del progetto
 
@@ -263,6 +268,8 @@ raspberry/              installazione sul Raspberry Pi delle integrazioni che gi
 tests/                  test senza Miniserver:  python -m unittest discover -s tests
 CLAUDE.md               istruzioni e regole per Claude (pubbliche)
 CLAUDE.local.md         dati del tuo impianto (privato, creato al primo avvio)
+CONTRIBUTING.md         come contribuire; SECURITY.md: come segnalare un problema di sicurezza
+.github/                modelli per segnalazioni e Pull Request, test automatici
 ```
 
 ## English summary

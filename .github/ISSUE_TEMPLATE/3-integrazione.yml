@@ -1,0 +1,35 @@
+name: Proposta di integrazione o miglioramento
+description: Un dispositivo da collegare a Loxone, o un'idea per il progetto
+labels: [integrazione]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Questa pagina e' pubblica.** Niente dati della tua casa. Le regole della libreria sono in
+        [`integrazioni/README.md`](https://github.com/Henry12034/claudelox/blob/main/integrazioni/README.md).
+  - type: input
+    id: dispositivo
+    attributes:
+      label: Dispositivo o funzione
+      description: Marca, modello e firmware, se e' un dispositivo
+      placeholder: Marca Modello, firmware 1.2.3
+    validations:
+      required: true
+  - type: textarea
+    id: scopo
+    attributes:
+      label: Cosa dovrebbe fare
+    validations:
+      required: true
+  - type: textarea
+    id: protocollo
+    attributes:
+      label: Come comunica, se lo sai
+      description: API locale, Bluetooth, cloud, documentazione disponibile
+  - type: checkboxes
+    id: aiuto
+    attributes:
+      label: Puoi aiutare?
+      options:
+        - label: Posso provarla sul mio dispositivo
+        - label: Posso preparare io la Pull Request

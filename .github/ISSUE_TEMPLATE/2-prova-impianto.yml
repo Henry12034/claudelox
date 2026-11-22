@@ -1,0 +1,38 @@
+name: L'ho provato sul mio impianto
+description: Racconta cosa funziona su un altro Miniserver o firmware (e' il contributo piu' utile)
+labels: [prova-impianto]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Questa pagina e' pubblica.** Scrivi solo modello e versioni, niente dati della tua casa.
+  - type: input
+    id: miniserver
+    attributes:
+      label: Miniserver
+      description: Modello e firmware (li mostra `lox ping`)
+      placeholder: Miniserver Compact, 17.3.11.12
+    validations:
+      required: true
+  - type: input
+    id: sistema
+    attributes:
+      label: Computer
+      placeholder: macOS 15, Python 3.12
+    validations:
+      required: true
+  - type: checkboxes
+    id: funziona
+    attributes:
+      label: Cosa ha funzionato
+      options:
+        - label: Login, stato della casa e controllo generale (`lox salute`)
+        - label: Comandi (luci, scene)
+        - label: Scaricamento e analisi del programma
+        - label: Prova a secco del caricamento
+        - label: Caricamento diretto sul Miniserver
+        - label: Ritorno a una versione precedente
+  - type: textarea
+    id: note
+    attributes:
+      label: Cosa non ha funzionato, o altre note
