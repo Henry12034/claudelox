@@ -99,7 +99,7 @@ def main() -> None:
     for e in new_prog.components():
         if e.get("Title") in (title_on, title_off):
             assert e in new_prog.page(args.pagina), "blocco finito fuori dalla pagina"
-    dup = [u for u in ids.used if text.count(f'U="{u}"') > 1]
+    dup = editor.duplicate_ids(text)
     if dup:
         raise SystemExit(f"ERRORE: UUID duplicati {dup}")
 

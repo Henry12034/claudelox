@@ -216,7 +216,7 @@ def main() -> None:
     assert new_prog.parent[cmd].get("U") == vout.get("U") and new_prog.parent[state].get("U") == page.get("U")
     new_lc = new_prog.by_uuid[lc.get("U")]
     assert len(list(new_lc.iter("LightsceneC"))) == len(moods) + len(scenes)
-    dup = [u for u in ids.used if len(re.findall(rf'\b(?:U|UUID)="{u}"', text)) > 1]
+    dup = editor.duplicate_ids(text)
     if dup:
         raise SystemExit(f"ERRORE: UUID duplicati {dup}")
 

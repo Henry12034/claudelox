@@ -781,7 +781,8 @@ def cmd_upload(args, s):
                   "(vedi sopra).")
         else:
             print("\n[PROVA] Nulla inviato al Miniserver. Tutto pronto per il caricamento diretto.")
-            print("Per attivarlo davvero: aggiungi --applica --conferma (riavvia la logica per ~10 s).")
+            print("Per attivarlo davvero: aggiungi --applica --conferma (riavvia la logica per ~10 s: alcune luci "
+                  "possono cambiare).")
             if not (ftp_user and ftp_pw):
                 print("Prima pero' serve la password dell'utente nel file .env (LOXONE_PASSWORD): il caricamento "
                       "usa l'FTP e un token amministratore temporaneo.")
@@ -817,6 +818,7 @@ def cmd_upload(args, s):
             ms.kill_token(forget_saved=False)  # revoca subito il token temporaneo di verifica
     except AuthError as e:
         raise LoxoneError(f"caricamento annullato prima di iniziare: {e}")
+    lights_before = read_lights(s)
     print(f"\nDiritti admin verificati per '{ftp_user}'. Carico sps_new.zip via FTP...")
     # un sps_new.zip rimasto sulla scheda (incompleto, o mai attivato) verrebbe caricato a un riavvio successivo:
     # se qualcosa va storto prima del riavvio della logica, va tolto
@@ -865,6 +867,7 @@ def cmd_upload(args, s):
             warn("il log non mostra ancora l'avvio, ma il programma attivo e' quello caricato")
         if new_app is not None:
             check_app_structure(s, new_app)
+        report_lights(s, lights_before)
         print("CARICAMENTO DIRETTO RIUSCITO.")
         return
 
@@ -881,10 +884,51 @@ def cmd_upload(args, s):
         warn(f"ripristino interrotto: {e}")
     if back_ok:
         print("Versione precedente ripristinata e verificata.")
+        report_lights(s, lights_before)
         raise LoxoneError("attivazione fallita: ripristinata la versione precedente. Controlla il file e riprova.")
     raise LoxoneError("attivazione fallita e ripristino NON confermato: controlla subito l'impianto. La versione "
                       f"precedente e' in {backup}: si ricarica con Loxone Config ('lox programma apri' dopo "
                       "'lox programma estrai') oppure con 'lox carica'.")
+
+
+def read_lights(s) -> dict[str, dict]:
+    """Stato dei controlli luci, per dire dopo un riavvio della logica se qualcuno e' cambiato. {} se non si legge."""
+    try:
+        st, ms = live_states(s)
+        with ms:
+            out = {}
+            for c in st.find(type_="LightControllerV2"):
+                states = st.states_of(c, ms.values, ms.texts)
+                try:
+                    moods = json.loads(states.get("activeMoods") or "[]")
+                except (TypeError, ValueError):
+                    moods = []
+                out[c["_uuid"]] = {"nome": c["name"], "stato": summarize(c, states),
+                                   "scene": moods if isinstance(moods, list) else []}
+            return out
+    except (LoxoneError, OSError, websocket.WebSocketException):
+        return {}
+
+
+def light_changes(before: dict, after: dict) -> list[str]:
+    """Luci diverse da prima del riavvio, con il comando per tornare indietro quando c'era una scena sola."""
+    lines = []
+    for uid, old in before.items():
+        new = after.get(uid)
+        if new and new["stato"] != old["stato"]:
+            back = (f"per tornare: lox comando {uid} changeTo/{old['scene'][0]}" if len(old["scene"]) == 1
+                    else "prima non aveva una scena attiva")
+            lines.append(f"{old['nome']}: {old['stato']} -> {new['stato']} ({back})")
+    return lines
+
+
+def report_lights(s, before: dict) -> None:
+    """Il riavvio puo' riaccendere un controllo luci col dimmer collegato al master: chi e' in casa lo deve sapere."""
+    changed = light_changes(before, read_lights(s))
+    if changed:
+        print("ATTENZIONE: il riavvio della logica ha cambiato queste luci (nessun comando inviato per rimetterle):")
+        for line in changed:
+            print(f"  - {line}")
 
 
 def alarm_block_reason(st: Structure, values: dict, texts: dict, blocks: int = 0) -> str | None:

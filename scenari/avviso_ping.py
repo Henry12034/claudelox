@@ -177,7 +177,7 @@ def main() -> None:
     changed = [ch for ch in d["modificati"] if not all(n.startswith("NumO:") for n in ch["modifiche"])]
     if d["rimossi"] or changed:                        # solo aggiunte (e il contatore di oggetti): il resto com'era
         raise SystemExit(f"ERRORE: modifiche inattese: {d['rimossi']} {changed}")
-    dup = [u for u in ids.used if len(re.findall(rf'\bU="{u}"', text)) > 1]
+    dup = editor.duplicate_ids(text)
     if dup:
         raise SystemExit(f"ERRORE: UUID duplicati {dup}")
 

@@ -271,7 +271,7 @@ def main() -> None:
         if e.get("Title") in (titolo_conferma, titolo_annulla) and e.get("Type") == "PushButton":
             assert [o.get("Title") for o, _, _ in fonti(new_prog, e, "Reset")] == [f"{e.get('Title')} (rilascio)"]
             assert all(c.get("Inv") != "true" for c in e.findall("Co") if c.get("K") == "Remanence"), "memoria"
-    dup = [u for u in ids.used if text.count(f'U="{u}"') > 1]
+    dup = editor.duplicate_ids(text)
     if dup:
         raise SystemExit(f"ERRORE: UUID duplicati {dup}")
 

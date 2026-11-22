@@ -11,6 +11,7 @@ creazione in secondi dal 1.1.2009 (come l'attributo LtE).
 """
 from __future__ import annotations
 
+import collections
 import re
 import secrets
 import time
@@ -58,6 +59,13 @@ class UuidFactory:
 
     def connector(self, block_uuid: str, index: int) -> str:
         return self._fresh(lambda: f"{block_uuid[:13]}-{secrets.randbits(16):04x}-{index:02x}ff{secrets.token_hex(6)}")
+
+
+def duplicate_ids(text: str) -> list[str]:
+    """UUID che identificano piu' di un oggetto (attributi U e UUID). Non contano gli attributi che finiscono per U
+    (SwBU, dal firmware 17.3), che citano un altro oggetto: lo stesso valore li' puo' ripetersi."""
+    counts = collections.Counter(re.findall(r'\b(?:U|UUID)="([0-9a-f-]+)"', text))
+    return sorted(u for u, n in counts.items() if n > 1)
 
 
 def element_span(text: str, uuid: str) -> tuple[int, int]:

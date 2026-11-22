@@ -988,6 +988,18 @@ class UploadFlowTest(unittest.TestCase):
             self.upload()
         self.assertEqual((self.restarts, self.deleted), ([], ["/prog/sps_new.zip"]))
 
+    def test_lights_changed_by_the_restart_are_reported(self):
+        before = {"a": {"nome": "Ingresso", "stato": "scene attive: Off", "scene": [778]},
+                  "b": {"nome": "Cucina", "stato": "scene attive: nessuna", "scene": []},
+                  "c": {"nome": "Bagno", "stato": "scene attive: Off", "scene": [778]}}
+        after = {"a": {"nome": "Ingresso", "stato": "scene attive: Tanta luce", "scene": [777]},
+                 "b": {"nome": "Cucina", "stato": "scene attive: Tanta luce", "scene": [777]},
+                 "c": {"nome": "Bagno", "stato": "scene attive: Off", "scene": [778]}}
+        lines = cli.light_changes(before, after)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("lox comando a changeTo/778", lines[0])            # si dice come tornare, senza farlo
+        self.assertIn("non aveva una scena", lines[1])
+
     def test_armed_alarm_stops_everything(self):
         with mock.patch.object(cli, "alarm_block_reason", lambda *a: "antifurto 'Casa' INSERITO"), \
                 self.assertRaisesRegex(LoxoneError, "INSERITO"):
@@ -1009,6 +1021,13 @@ class CopiesAndSecretsTest(unittest.TestCase):
         group, _ = editor.clone_group(self.XML, [U(90)], editor.UuidFactory(self.XML))
         self.assertNotIn(U(91), group[0])
         self.assertNotIn(U(92), group[0])
+
+    def test_only_real_duplicate_ids_are_reported(self):
+        a, b = U(95), U(96)
+        firmware_17_3 = f'<C U="{a}" SwBU="{b}"/><C U="{b}" SwBU="{b}"/>'   # SwBU cita un altro oggetto
+        self.assertEqual(editor.duplicate_ids(firmware_17_3), [])
+        self.assertEqual(editor.duplicate_ids(f'<C U="{a}"/><C U="{a}"/>'), [a])
+        self.assertEqual(editor.duplicate_ids(f'<C U="{a}"/><L UUID="{a}"/>'), [a])
 
     def test_a_copy_refuses_connectors_the_model_does_not_have(self):
         block = Program(self.XML.encode("utf-8")).by_uuid[U(90)]

@@ -174,7 +174,7 @@ def main() -> None:
     new_in = new_prog.by_uuid[http_u]
     assert new_prog.parent[new_in] is not None and new_prog.parent[new_in].get("U") == container.get("U")
     assert len([c for c in new_in if c.tag == "C"]) == 1 + len(cmds), "comandi mancanti nell'ingresso"
-    dup = [u for u in ids.used if text.count(f'U="{u}"') > 1]
+    dup = editor.duplicate_ids(text)
     if dup:
         raise SystemExit(f"ERRORE: UUID duplicati {dup}")
 
