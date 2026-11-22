@@ -4,13 +4,27 @@ After=bluetooth.service network-online.target
 Wants=bluetooth.service network-online.target
 
 [Service]
+# utente del servizio: raspberry/install.sh mette qui quello scelto (SERVICE_USER); nel repository e' "pi"
 User=pi
 EnvironmentFile=/etc/default/loxone-govee
 ExecStart=/opt/claudelox-raspberry/venv/bin/python /opt/claudelox-raspberry/loxone_govee.py run
 Restart=always
 RestartSec=5
+# 78 = manca GOVEE_ADDRESS: riavviare non serve, si aspetta che venga scritto in /etc/default/loxone-govee
+RestartPreventExitStatus=78
 # chiusura dei collegamenti Bluetooth: se BlueZ non risponde non si aspettano i 90 s predefiniti
 TimeoutStopSec=15
+# protezioni prudenti: il servizio non acquista privilegi e non scrive nel sistema ne' nelle cartelle personali
+# (nessun limite alle famiglie di socket: il Bluetooth passa da D-Bus)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

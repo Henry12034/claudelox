@@ -11,17 +11,18 @@ Eventi letti come documenti XML completi, un solo comando per evento (le telecam
 ogni secondo), filtri per regione e tipo di bersaglio (persona/veicolo), ricollegamento automatico, log
 nel journal di sistema.
 
-Configurazione TOML (sul Raspberry: /etc/hikvision-loxone/config.toml, leggibile solo dal servizio):
+Configurazione TOML (sul Raspberry: /etc/hikvision-loxone/config.toml, leggibile solo da root e dal gruppo
+dell'utente del servizio):
 
     [miniserver]
-    host = "192.168.1.10"
-    user = "..."                    # utente Loxone dedicato, con accesso agli ingressi usati
-    password = "..."
+    host = "10.0.0.2"
+    user = "..."                    # utente Loxone dedicato, con i permessi minimi (mai un amministratore:
+    password = "..."                # la password viaggia in chiaro nella rete di casa, HTTP Basic)
     command = "SET(Sw;On;Pulse)"    # facoltativo
 
     [[cameras]]
     name = "Esterna"
-    host = "192.168.1.20"
+    host = "10.0.0.5"
     user = "..."
     password = "..."
 
@@ -33,11 +34,16 @@ Configurazione TOML (sul Raspberry: /etc/hikvision-loxone/config.toml, leggibile
     inputs = ["movimento_ingresso"] # ingressi virtuali di Loxone da attivare
     cooldown = 5                    # facoltativo: secondi minimi tra due comandi uguali
 
+Una chiave sconosciuta in una regola e' un errore (non viene ignorata). Le regole del riconoscimento facciale
+('person', oppure type = "volto") vogliono 'min_similarity' e partono in prova: comandano Loxone solo con
+dry_run = false. Esempi completi in hikvision-loxone.example.toml.
+
 Uso:
   hikvision_loxone.py run                      avvia il ponte (servizio systemd)
   sudo hikvision_loxone.py configura --miniserver IP --telecamere IP1,IP2
                                                chiede e verifica utenti e password (Loxone e telecamere),
-                                               poi scrive la configurazione mantenendo le regole esistenti
+                                               poi scrive la configurazione: regole e telecamere saltate
+                                               restano com'erano, il file di prima resta in config.toml.bak
   hikvision_loxone.py info                     modello, telecamere collegate, rilevazioni attive, eventi inviati
   hikvision_loxone.py ora <telecamera>         ora automatica (NTP) e fuso dell'Europa centrale con ora legale
   hikvision_loxone.py volti elenco <registratore>
@@ -61,8 +67,10 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -78,7 +86,10 @@ CONFIG_PATH = "/etc/hikvision-loxone/config.toml"
 ISAPI_NS = "http://www.isapi.org/ver20/XMLSchema"
 CET_TZ = "CST-1:00:00DST01:00:00,M3.5.0/02:00:00,M10.5.0/03:00:00"   # Europa centrale (UTC+1) con ora legale
 MAX_FACE_KB = 500       # il registratore accetta foto fino a 512 KB
-SERVICE_GROUP = "pi"    # il servizio gira come utente pi: deve poter leggere la configurazione
+# gruppo che deve poter leggere la configurazione (quello dell'utente del servizio): lo dice questa variabile,
+# altrimenti il gruppo che hanno gia' il file o la sua cartella (preparata da install.sh), altrimenti "pi"
+SERVICE_GROUP_ENV = "HIKVISION_LOXONE_GROUP"
+DEFAULT_SERVICE_GROUP = "pi"
 DEFAULT_COMMAND = "SET(Sw;On;Pulse)"
 STREAM_PATH = "/ISAPI/Event/notification/alertStream"
 SILENCE_S = 90          # senza dati (nemmeno il "videoloss" periodico) il collegamento si considera perso
@@ -98,7 +109,12 @@ LOCAL_FACE_TRIGGERS = ("fielddetection", "linedetection")
 SNAPSHOT_PATH = "/ISAPI/Streaming/channels/101/picture"   # foto a piena risoluzione della telecamera
 WATCH_REPORT_S = 600    # analisi continua: un riepilogo nel log ogni 10 minuti
 WATCH_LOG_GAP_S = 2.0   # ... e al massimo una riga ogni 2 s mentre riconosce qualcuno
-FACE_SAVED = FACE_TYPES | {"facedetection", "facecontrastfailure"}   # eventi di cui si tengono documento e foto
+# eventi dei volti di cui si possono tenere documento e foto: solo con una persona riconosciuta, salvo
+# l'opzione di diagnostica save_unknown_faces (vedi keep_face_event)
+FACE_SAVED = FACE_TYPES | {"facedetection", "facecontrastfailure"}
+OPTION_DEFAULTS = {"save_unknown_faces": False}    # chiavi in cima al file di configurazione, prima di [miniserver]
+RULE_KEYS = ("type", "inputs", "region", "target", "channel", "cooldown", "person", "min_similarity",
+             "confirmations", "window", "dry_run", "triggers", "continuous")
 FACE_DIR = os.path.join(os.environ.get("STATE_DIRECTORY", "/var/lib/hikvision-loxone"), "volti")
 FACE_KEEP = 60          # file tenuti in FACE_DIR: documento e foto degli ultimi eventi dei volti
 MIN_HIT_GAP_S = 1.0     # due riconoscimenti piu' vicini di cosi' sono lo stesso (eventi ripetuti)
@@ -123,7 +139,9 @@ class Rule:
     min_similarity: float = 0.0     # ... con somiglianza almeno questa (percento)
     confirmations: int = 1          # riconoscimenti necessari entro "window" secondi prima di agire
     window: float = 20.0
-    dry_run: bool = False           # prova: scrive nel log cosa farebbe, senza comandare Loxone
+    # prova: scrive nel log cosa farebbe, senza comandare Loxone (nel file di configurazione le regole del
+    # riconoscimento facciale partono in prova se non c'e' scritto dry_run = false: vedi rule_from_dict)
+    dry_run: bool = False
     # regole "volto" (riconoscimento sul Raspberry): eventi della telecamera che fanno partire la raffica di foto
     triggers: list[str] = field(default_factory=lambda: list(LOCAL_FACE_TRIGGERS))
     continuous: bool = False        # regole "volto": analisi continua delle foto, senza aspettare gli eventi
@@ -157,21 +175,85 @@ def load_config(text: str) -> tuple[dict, list[Camera]]:
             raise ValueError(f"[miniserver] manca '{key}'")
     cams = []
     for c in data.get("cameras") or []:
-        rules = [rule_from_dict(e) for e in c.get("events") or []]
+        rules = []
+        for n, e in enumerate(c.get("events") or [], 1):
+            try:
+                rules.append(rule_from_dict(e))
+            except ValueError as err:                        # dice dove sta la regola sbagliata
+                raise ValueError(f"telecamera {c.get('name', '?')}, regola {n}: {err}") from None
         cams.append(Camera(name=c["name"], host=c["host"], user=c["user"], password=c["password"], rules=rules))
     if not cams:
         raise ValueError("nessuna telecamera in [[cameras]]")
     return ms, cams
 
 
+def load_options(text: str) -> dict:
+    """Opzioni generali: le chiavi in cima al file di configurazione, prima di [miniserver]."""
+    data = tomllib.loads(text)
+    options = dict(OPTION_DEFAULTS)
+    for key in options:
+        if key in data:
+            if not isinstance(data[key], bool):
+                raise ValueError(f"{key} deve essere true o false")
+            options[key] = data[key]
+    return options
+
+
+def is_face_rule(rule: Rule) -> bool:
+    """Regola del riconoscimento facciale (persona dell'archivio o tipo "volto"): puo' disinserire un antifurto."""
+    return bool(rule.person) or rule.type == LOCAL_FACE
+
+
+def local_face_min_similarity() -> float:
+    """Somiglianza minima (percento) accettata nelle regole "volto": la soglia di SFace per "stessa persona"."""
+    try:
+        from volti_locali import SAME_PERSON
+    except ImportError:
+        raise ValueError('le regole "volto" vogliono volti_locali.py accanto a hikvision_loxone.py') from None
+    return round(SAME_PERSON * 100, 4)
+
+
 def rule_from_dict(e: dict) -> Rule:
+    """Regola del file di configurazione -> Rule; una chiave sbagliata e' un errore, non viene ignorata.
+
+    Le regole del riconoscimento facciale ('person' oppure type = "volto") possono disinserire un antifurto:
+    senza 'dry_run' partono in prova e vogliono 'min_similarity' scritto e maggiore di 0 (per "volto" almeno
+    la soglia di SFace); una regola "volto" vuole anche 'person'.
+    """
+    unknown = [k for k in e if k not in RULE_KEYS]
+    if unknown:
+        raise ValueError(f"chiave sconosciuta {', '.join(repr(k) for k in unknown)} "
+                         f"(chiavi valide: {', '.join(RULE_KEYS)})")
     if not e.get("type") or not e.get("inputs"):
         raise ValueError("una regola vuole almeno 'type' e 'inputs'")
-    return Rule(type=e["type"].lower(), inputs=list(e["inputs"]), region=e.get("region"),
+    for key in ("dry_run", "continuous"):
+        if key in e and not isinstance(e[key], bool):
+            raise ValueError(f"'{key}' deve essere true o false")
+    if "person" in e and not (isinstance(e["person"], str) and e["person"].strip()):
+        raise ValueError("'person' e' vuoto: scrivi il nome della persona oppure togli la chiave")
+    rtype = e["type"].lower()
+    face = "person" in e or rtype == LOCAL_FACE
+    if face:
+        if "person" not in e:
+            raise ValueError("una regola \"volto\" vuole 'person': il nome della persona da riconoscere")
+        value = e.get("min_similarity")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("una regola del riconoscimento facciale vuole 'min_similarity' scritto: la "
+                             "somiglianza minima in percento (un numero maggiore di 0)")
+        if not value > 0:
+            raise ValueError(f"'min_similarity' deve essere maggiore di 0: con {value:g} la regola scatterebbe "
+                             f"con qualunque somiglianza")
+        if rtype == LOCAL_FACE:
+            lowest = local_face_min_similarity()
+            if value < lowest:
+                raise ValueError(f"'min_similarity' di una regola \"volto\" deve essere almeno {lowest:g} (in "
+                                 f"percento: e' la soglia di SFace per \"stessa persona\"); {value:g} e' troppo "
+                                 f"basso")
+    return Rule(type=rtype, inputs=list(e["inputs"]), region=e.get("region"),
                 target=(e.get("target") or None) and e["target"].lower(), cooldown=float(e.get("cooldown", 5)),
                 channel=e.get("channel"), person=e.get("person"), min_similarity=float(e.get("min_similarity", 0)),
                 confirmations=int(e.get("confirmations", 1)), window=float(e.get("window", 20)),
-                dry_run=bool(e.get("dry_run", False)),
+                dry_run=bool(e.get("dry_run", face)),      # i volti partono in prova se non c'e' scritto altro
                 triggers=[x.lower() for x in e.get("triggers", LOCAL_FACE_TRIGGERS)],
                 continuous=bool(e.get("continuous", False)))
 
@@ -244,22 +326,49 @@ def parse_event(xml_bytes: bytes) -> Event | None:
 def face_match(root: ET.Element) -> tuple[str | None, float | None]:
     """Persona dell'archivio e somiglianza (percento) di un evento del riconoscimento facciale.
 
-    Il formato cambia tra modelli e firmware: la somiglianza e' il valore piu' alto tra i campi "similarity",
-    la persona il primo campo "name" che non sta direttamente sotto la radice (li' c'e' il canale).
+    Il formato cambia tra modelli e firmware. Un evento puo' elencare piu' candidati: vale quello con la
+    somiglianza piu' alta, con il SUO nome. Il nome di una somiglianza e' il primo campo "name" dentro
+    l'elemento piu' vicino che ne contiene uno (non contano i "name" direttamente sotto la radice: li' c'e' il
+    canale). Se quell'elemento raccoglie piu' somiglianze e lo stesso campo con nomi diversi (candidati
+    mescolati) non si sa di chi sia il valore: resta senza persona, e nessuna regola scatta.
     """
-    sims = []
-    for el in root.iter():
-        if isinstance(el.tag, str) and el.tag.lower() in ("similarity", "maxsimilarity"):
-            try:
-                sims.append(float((el.text or "").strip()))
-            except ValueError:
-                pass
-    similarity = max(sims) if sims else None
-    if similarity is not None and similarity <= 1.0:
-        similarity *= 100                                    # alcuni modelli scrivono 0,87 invece di 87
+    def is_similarity(el: ET.Element) -> bool:
+        return isinstance(el.tag, str) and el.tag.lower() in ("similarity", "maxsimilarity")
+
     top_level = set(root)
-    person = next(((el.text or "").strip() for el in root.iter() if el.tag in ("name", "personName", "humanName")
-                   and el not in top_level and (el.text or "").strip()), None)
+    parents = {child: parent for parent in root.iter() for child in parent}
+
+    def names_in(node: ET.Element) -> list[tuple[str, str]]:
+        """(campo, nome) dei nomi di persona dentro l'elemento, nell'ordine del documento."""
+        return [(el.tag, (el.text or "").strip()) for el in node.iter()
+                if el.tag in ("name", "personName", "humanName") and el not in top_level and (el.text or "").strip()]
+
+    candidates: list[tuple[float, bool, str | None]] = []
+    for el in root.iter():
+        if not is_similarity(el):
+            continue
+        try:
+            value = float((el.text or "").strip())
+        except ValueError:
+            continue
+        if not math.isfinite(value):
+            continue
+        node, names = parents.get(el), []
+        while node is not None and not names:
+            names = names_in(node)
+            if not names:
+                node = parents.get(node)
+        person = names[0][1] if names else None
+        mixed = any(len({text for tag, text in names if tag == which}) > 1 for which, _ in names)
+        if mixed and sum(1 for x in node.iter() if is_similarity(x)) > 1:
+            person = None                                    # piu' candidati mescolati: non si attribuisce
+        candidates.append((value, person is not None, person))
+    if not candidates:
+        names = names_in(root)
+        return (names[0][1] if names else None), None
+    similarity, _, person = max(candidates, key=lambda c: c[:2])   # a pari somiglianza, quello con il nome
+    if similarity <= 1.0:
+        similarity *= 100                                    # alcuni modelli scrivono 0,87 invece di 87
     return person, similarity
 
 
@@ -340,6 +449,15 @@ class Loxone:
         else:
             log.error("Loxone ha rifiutato %s (HTTP %s %s)", input_name, r.status_code, r.text[:120])
         return ok
+
+
+def keep_face_event(ev: Event, save_unknown: bool = False) -> bool:
+    """Documento e foto di un evento dei volti si tengono solo se l'evento porta una persona riconosciuta.
+
+    Delle persone sconosciute (volto rilevato, confronto fallito o senza nome) non si salva niente, salvo con
+    l'opzione di diagnostica save_unknown_faces = true.
+    """
+    return ev.type in FACE_SAVED and (save_unknown or bool(ev.person))
 
 
 def save_face_file(name: str, ext: str, data: bytes, stamp: bool = True, folder: str | None = None) -> str | None:
@@ -439,7 +557,7 @@ def local_faces_command(args, camera) -> None:
         face = max(faces, key=lambda r: r[2] * r[3])
         vec = recog.feature(img, face)
         sim = recog.similarity_to(args.persona, vec)
-        if sim is not None and sim < vl.SAME_PERSON and not args.forza:
+        if sim is not None and sim * 100 < args.minimo and not args.forza:
             print(stamp, f"volto {int(face[2])} px troppo diverso da {args.persona} ({sim * 100:.0f}%): non lo imparo")
             continue
         recog.add(args.persona, vec)
@@ -467,10 +585,11 @@ def save_face_crop(recog, name: str, jpeg: bytes, box: tuple[int, int, int, int]
 
 
 class CameraWorker(threading.Thread):
-    def __init__(self, cam: Camera, loxone: Loxone) -> None:
+    def __init__(self, cam: Camera, loxone: Loxone, save_unknown_faces: bool = False) -> None:
         super().__init__(name=f"cam-{cam.name}", daemon=True)
         self.cam = cam
         self.loxone = loxone
+        self.save_unknown_faces = save_unknown_faces   # diagnostica: tiene anche gli eventi di persone sconosciute
         self.last_fired: dict[tuple[int, str], float] = {}
         self.logged: dict[tuple, tuple[str, float]] = {}
         self.hits: dict[int, list[float]] = {}
@@ -544,8 +663,8 @@ class CameraWorker(threading.Thread):
                 recog.load()                                 # impronte aggiornate (es. dopo "volti-locali impara")
                 res = run_burst(grab, recog.identify, rule.person, rule.min_similarity, max(1, rule.confirmations),
                                 rule.window)
-                if res.best is not None:
-                    save_face_crop(recog, f"{self.cam.name}_volto_{res.best.person or 'sconosciuto'}_"
+                if res.matches and res.best is not None:       # solo la persona riconosciuta, mai gli altri
+                    save_face_crop(recog, f"{self.cam.name}_volto_{res.best.person}_"
                                           f"{res.best.similarity * 100:.0f}", res.best_photo, res.best.box)
             best = (f"{res.best.person or 'sconosciuto'} {res.best.similarity * 100:.0f}% ({res.best.width} px)"
                     if res.best else "nessun volto")
@@ -621,6 +740,21 @@ class CameraWorker(threading.Thread):
                 since = now
             time.sleep(PHOTO_GAP_S)
 
+    def read_stream(self, stream, boundary: bytes) -> None:
+        """Legge il flusso degli eventi: li gestisce e, per quelli dei volti da tenere, salva documento e foto."""
+        face_stem, face_pics = None, 0
+        for ctype, body in iter_parts(stream, boundary):
+            if "xml" in ctype or body.lstrip().startswith(b"<"):
+                ev = parse_event(body)
+                face_stem, face_pics = None, 0
+                if ev:
+                    if keep_face_event(ev, self.save_unknown_faces):
+                        face_stem = save_face_file(f"{self.cam.name}_{ev.type}", ".xml", body)
+                    self.handle(ev)
+            elif face_stem and "image" in ctype and face_pics < 2:   # volto e scena dell'evento
+                face_pics += 1
+                save_face_file(f"{face_stem}_{face_pics}", ".jpg", body, stamp=False)
+
     def run(self) -> None:
         import requests
         from requests.auth import HTTPDigestAuth
@@ -644,19 +778,7 @@ class CameraWorker(threading.Thread):
                     log.info("%s: collegata, in ascolto degli eventi", self.cam.name)
                     backoff = 5
                     r.raw.decode_content = True
-                    stream = io.BufferedReader(r.raw, buffer_size=65536)
-                    face_stem, face_pics = None, 0
-                    for ctype, body in iter_parts(stream, boundary):
-                        if "xml" in ctype or body.lstrip().startswith(b"<"):
-                            ev = parse_event(body)
-                            face_stem, face_pics = None, 0
-                            if ev:
-                                if ev.type in FACE_SAVED:
-                                    face_stem = save_face_file(f"{self.cam.name}_{ev.type}", ".xml", body)
-                                self.handle(ev)
-                        elif face_stem and "image" in ctype and face_pics < 2:   # volto e scena dell'evento
-                            face_pics += 1
-                            save_face_file(f"{face_stem}_{face_pics}", ".jpg", body, stamp=False)
+                    self.read_stream(io.BufferedReader(r.raw, buffer_size=65536), boundary)
                 log.warning("%s: flusso eventi chiuso dalla telecamera", self.cam.name)
             except Exception as e:  # rete, telecamera riavviata, timeout di silenzio: si riprova
                 log.warning("%s: collegamento perso (%s: %s)", self.cam.name, type(e).__name__, e)
@@ -677,9 +799,12 @@ def toml_str(value: str) -> str:
     return '"' + "".join(out) + '"'
 
 
-def dump_config(ms: dict, cams: list[Camera]) -> str:
-    lines = ["# Scritto da 'hikvision_loxone.py configura'. Contiene password: leggibile solo da root e dal servizio.",
-             "", "[miniserver]"]
+def dump_config(ms: dict, cams: list[Camera], options: dict | None = None) -> str:
+    lines = ["# Scritto da 'hikvision_loxone.py configura'. Contiene password: leggibile solo da root e dal servizio."]
+    if (options or {}).get("save_unknown_faces"):            # le chiavi generali stanno prima di [miniserver]
+        lines += ["", "# diagnostica: tiene documento e foto anche dei volti NON riconosciuti (persone sconosciute)",
+                  "save_unknown_faces = true"]
+    lines += ["", "[miniserver]"]
     lines += [f"{k} = {toml_str(str(ms[k]))}" for k in ("host", "user", "password", "command") if ms.get(k)]
     for cam in cams:
         lines += ["", "[[cameras]]"] + [f"{k} = {toml_str(getattr(cam, k))}" for k in ("name", "host", "user", "password")]
@@ -696,8 +821,12 @@ def dump_config(ms: dict, cams: list[Camera]) -> str:
             if r.min_similarity:
                 lines.append(f"min_similarity = {r.min_similarity:g}")
             if r.confirmations != 1:
-                lines += [f"confirmations = {int(r.confirmations)}", f"window = {r.window:g}"]
-            if r.dry_run:
+                lines.append(f"confirmations = {int(r.confirmations)}")
+            if r.confirmations != 1 or r.window != 20.0 or r.type == LOCAL_FACE:   # "volto": secondi di foto
+                lines.append(f"window = {r.window:g}")
+            if is_face_rule(r):                              # sempre scritto: senza, la regola torna in prova
+                lines.append(f"dry_run = {'true' if r.dry_run else 'false'}")
+            elif r.dry_run:
                 lines.append("dry_run = true")
             if r.type == LOCAL_FACE:
                 lines.append("triggers = [" + ", ".join(toml_str(x) for x in r.triggers) + "]")
@@ -749,32 +878,91 @@ def _ask(prompt: str, default: str = "") -> str:
     return value or default
 
 
-def write_private(path: str, text: str) -> None:
-    """Scrive il file con permessi 0640, proprietario root e gruppo del servizio."""
+def service_gid(path: str) -> int | None:
+    """Gruppo che deve poter leggere la configurazione (quello dell'utente del servizio); None se non si trova.
+
+    Nell'ordine: la variabile HIKVISION_LOXONE_GROUP, il gruppo che il file ha gia', quello della sua cartella
+    (lo imposta install.sh), infine "pi". Il gruppo di root non conta: vuol dire "nessun gruppo scelto".
+    """
     import grp
+    name = os.environ.get(SERVICE_GROUP_ENV, "").strip()
+    if not name:
+        for existing in (path, os.path.dirname(path)):
+            try:
+                gid = os.stat(existing).st_gid
+            except OSError:
+                continue
+            if gid:
+                return gid
+        name = DEFAULT_SERVICE_GROUP
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        return None
+
+
+def write_private(path: str, text: str) -> None:
+    """Scrive il file leggibile solo da root e dal gruppo del servizio (0640).
+
+    Se quel gruppo non esiste non si ferma (nella procedura guidata le password sono gia' state scritte): salva
+    il file leggibile solo da root (0600) e dice come dargli il gruppo giusto.
+    """
+    gid = service_gid(path)
+    mode = 0o640 if gid is not None else 0o600
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
-    os.chown(tmp, 0, grp.getgrnam(SERVICE_GROUP).gr_gid)
-    os.chmod(tmp, 0o640)
+    os.chown(tmp, 0, gid or 0)
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
+    if gid is None:
+        wanted = os.environ.get(SERVICE_GROUP_ENV, "").strip() or DEFAULT_SERVICE_GROUP
+        print(f"ATTENZIONE: il gruppo '{wanted}' non esiste su questo sistema: {path} e' stato salvato leggibile "
+              f"solo da root e il servizio non riuscira' a leggerlo.\n"
+              f"  Dagli il gruppo dell'utente del servizio:  sudo chgrp <gruppo> {path} && sudo chmod 640 {path}\n"
+              f"  (oppure rilancia 'sudo bash raspberry/install.sh hikvision-isapi', che sistema gruppo e permessi)")
+
+
+def backup_config(path: str) -> str | None:
+    """Copia il file attuale in <path>.bak, con lo stesso proprietario e gli stessi permessi (contiene password)."""
+    if not os.path.isfile(path):
+        return None
+    st = os.stat(path)
+    with open(path, "rb") as f:
+        data = f.read()
+    backup, tmp = path + ".bak", path + ".bak.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.chmod(tmp, stat.S_IMODE(st.st_mode))
+    os.replace(tmp, backup)
+    return backup
 
 
 def configure(path: str, miniserver: str, camera_hosts: list[str]) -> None:
-    """Procedura guidata: le password le scrive l'utente e vengono verificate prima di salvarle."""
+    """Procedura guidata: le password le scrive l'utente e vengono verificate prima di salvarle.
+
+    Una telecamera gia' configurata che viene saltata (password vuota), non risponde o non supera la verifica
+    resta com'era, con utente, password e regole di prima. Prima di riscrivere il file ne tiene una copia (.bak).
+    """
     import getpass
     if os.geteuid() != 0:
         raise SystemExit("esegui con sudo: la configurazione sta in /etc/hikvision-loxone")
     old_ms: dict = {}
     old_cams: list[Camera] = []
+    old_options: dict = {}
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as f:
-                old_ms, old_cams = load_config(f.read())
-        except (OSError, ValueError, KeyError, tomllib.TOMLDecodeError):
-            print("(configurazione esistente illeggibile: si riparte da zero)")
+                text = f.read()
+            old_ms, old_cams, old_options = *load_config(text), load_options(text)
+        except (OSError, ValueError, KeyError, tomllib.TOMLDecodeError) as e:
+            print(f"(configurazione esistente non valida: {f'manca {e}' if isinstance(e, KeyError) else e})")
+            print(f"(si riparte da zero: telecamere e regole di adesso NON vengono riportate; prima di "
+                  f"riscrivere il file, quello di adesso viene copiato in {path}.bak)")
     print("Configurazione del ponte telecamere -> Loxone.")
     print("Le password non si vedono mentre le scrivi: scrivile e premi Invio.\n")
     print("1) Miniserver Loxone")
@@ -791,13 +979,14 @@ def configure(path: str, miniserver: str, camera_hosts: list[str]) -> None:
         raise SystemExit("credenziali Loxone non verificate: niente e' stato salvato")
     ms = {"host": host, "user": user, "password": password, "command": old_ms.get("command", "")}
 
-    print("\n2) Telecamere Hikvision (password vuota = salta la telecamera)")
+    print("\n2) Telecamere Hikvision (password vuota = salta la telecamera; una gia' configurata resta com'era)")
     known = {c.host: c for c in old_cams}
     cams: list[Camera] = []
     for cam_host in dict.fromkeys(camera_hosts + [c.host for c in old_cams]):
         old = known.get(cam_host)
         print(f"\n   Telecamera {cam_host}")
         name = _ask("   Nome da usare nei log (es. Esterna)", old.name if old else f"Telecamera_{cam_host.rsplit('.', 1)[-1]}")
+        verified = False
         for _ in range(3):
             cam_user = _ask("   Utente", old.user if old else "admin")
             cam_password = getpass.getpass("   Password: ")
@@ -808,15 +997,25 @@ def configure(path: str, miniserver: str, camera_hosts: list[str]) -> None:
             if err is None:
                 print(f"   OK: {info}")
                 cams.append(Camera(name, cam_host, cam_user, cam_password, old.rules if old else []))
+                verified = True
                 break
             print(f"   {err}")
             if "non raggiungibile" in err:
                 break
+        if not verified and old is not None:                 # saltata, spenta o non verificata: non si perde
+            cams.append(old)
+            print(f"   {old.name} resta com'era nella configurazione: utente, password e {len(old.rules)} regole "
+                  f"di prima (per toglierla del tutto cancella il suo blocco [[cameras]] dal file)")
     if not cams:
         raise SystemExit("nessuna telecamera verificata: niente e' stato salvato")
-    write_private(path, dump_config(ms, cams))
+    try:
+        backup = backup_config(path)
+    except OSError as e:
+        raise SystemExit(f"copia di sicurezza di {path} non riuscita ({e}): niente e' stato salvato")
+    write_private(path, dump_config(ms, cams, old_options))
     rules = sum(len(c.rules) for c in cams)
-    print(f"\nSalvato {path}: {len(cams)} telecamere, {rules} regole.")
+    print(f"\nSalvato {path}: {len(cams)} telecamere, {rules} regole."
+          + (f" La configurazione di prima e' in {backup}." if backup else ""))
     subprocess.run(["systemctl", "restart", "hikvision-loxone.service"], check=False)
     print("Servizio hikvision-loxone riavviato" + ("" if rules else ": per ora registra solo gli eventi, "
                                                     "senza comandare Loxone"))
@@ -838,12 +1037,14 @@ def _get_xml(cam: Camera, path: str, timeout: float = 10) -> tuple[ET.Element | 
         return None, "risposta non XML"
 
 
-SECRET_TAG_RE = re.compile(r"(?i)pass|secret|key|token")
+# nomi (anche solo una parte, senza badare alle maiuscole) dei campi il cui valore non si stampa mai: password,
+# chiavi, codici (es. verificationCode di EZVIZ / Hik-Connect, community di SNMP, PSK e PIN del Wi-Fi)
+SECRET_TAG_RE = re.compile(r"(?i)pass|pwd|secret|key|token|community|psk|pin|verificationcode")
 PRIVATE_PATH_RE = re.compile(r"(?i)security|user|account")
 
 
 def redact_xml(root: ET.Element) -> ET.Element:
-    """Nasconde i valori dei campi che possono contenere password o chiavi."""
+    """Nasconde i valori dei campi che possono contenere password, chiavi o codici (vedi SECRET_TAG_RE)."""
     for el in root.iter():
         if isinstance(el.tag, str) and SECRET_TAG_RE.search(el.tag) and (el.text or "").strip():
             el.text = "***"
@@ -1331,6 +1532,8 @@ def main(argv: list[str] | None = None) -> None:
     f.add_argument("persona")
     f.add_argument("--secondi", type=float, default=10)
     f.add_argument("--massimo", type=int, default=8, help="impronte nuove al massimo")
+    f.add_argument("--minimo", type=float, default=40,
+                   help="somiglianza minima (percento) con le impronte gia' note per accettare un volto (40)")
     f.add_argument("--forza", action="store_true", help="impara anche volti poco somiglianti a quelli gia' noti")
     local.add_parser("elenco", help="volti imparati")
     f = local.add_parser("dimentica")
@@ -1358,7 +1561,13 @@ def main(argv: list[str] | None = None) -> None:
         return
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout)
     with open(args.config, encoding="utf-8") as f:
-        ms, cams = load_config(f.read())
+        text = f.read()
+    try:
+        ms, cams = load_config(text)
+        options = load_options(text)
+    except (ValueError, KeyError, tomllib.TOMLDecodeError) as e:     # una riga chiara nel log, non una traccia
+        raise SystemExit(f"ERRORE nella configurazione {args.config}: "
+                         f"{f'manca {e}' if isinstance(e, KeyError) else e}")
     if args.cmd == "info":
         for cam in cams:
             print("\n".join(describe_device(cam)))
@@ -1381,7 +1590,7 @@ def main(argv: list[str] | None = None) -> None:
                 raise SystemExit(f"ERRORE: {e}")
             if os.geteuid() != 0:
                 raise SystemExit("per salvare le regole esegui con sudo")
-            write_private(args.config, dump_config(ms, cams))
+            write_private(args.config, dump_config(ms, cams, options))
             subprocess.run(["systemctl", "restart", "hikvision-loxone.service"], check=False)
             print("regole salvate, servizio riavviato")
         for i, rule in enumerate(cam.rules, 1):
@@ -1418,14 +1627,18 @@ def main(argv: list[str] | None = None) -> None:
     loxone = Loxone(ms)
     if args.cmd == "prova":
         sys.exit(0 if loxone.trigger(args.ingresso) else 1)
+    save_unknown = options["save_unknown_faces"]
+    if save_unknown:
+        log.warning("save_unknown_faces = true: si salvano documento e foto anche dei volti di persone sconosciute "
+                    "(in %s); e' un'opzione di diagnostica, toglila finite le prove", FACE_DIR)
     if args.cmd == "eventi":
         cam = camera(args.telecamera)
         cam.rules = []  # solo ascolto: nessun comando a Loxone
-        CameraWorker(cam, loxone).start()
+        CameraWorker(cam, loxone, save_unknown).start()
         time.sleep(args.secondi)
         return
     for cam in cams:
-        CameraWorker(cam, loxone).start()
+        CameraWorker(cam, loxone, save_unknown).start()
         log.info("telecamera %s (%s): %d regole", cam.name, cam.host, len(cam.rules))
     while True:
         time.sleep(3600)

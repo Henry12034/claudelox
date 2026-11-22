@@ -1,6 +1,7 @@
 # <Marca e protocollo>: <cosa fa, in una riga>
 
 Stato: sperimentale | stabile. Gira su: Raspberry Pi | PC | altro. Servizio: `<nome>.service` (se c'e').
+Python: <versione minima, e quella con cui e' stato provato>.
 
 <Due righe: quale problema risolve per chi ha Loxone e cosa serve (dispositivo, Raspberry...).>
 
@@ -31,7 +32,8 @@ tempi, stranezze. Chi ha un modello simile deve poter capire se funzionera' e co
 
 ## Sicurezza e privacy
 
-<Cosa puo' comandare, modalita' di prova, cosa salva e per quanto tempo, cosa non salva.>
+<Cosa puo' comandare, modalita' di prova, chi puo' parlarle in rete e come limitarlo, cosa salva e per quanto
+tempo, cosa non salva. Librerie e modelli di terzi con la loro licenza.>
 
 ## Test
 

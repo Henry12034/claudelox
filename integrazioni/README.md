@@ -7,12 +7,15 @@ proprie**: piu' case, piu' dispositivi, una libreria sempre piu' grande.
 
 | Integrazione | Dispositivi provati | Protocollo | Cosa fa | Gira su | Stato |
 |---|---|---|---|---|---|
-| [govee-bluetooth](govee-bluetooth/) | Govee H6126 (firmware 2.06.1) | Bluetooth LE (GATT) | Loxone comanda le strisce LED: accensione, luminosita', colore, scene; piu' strisce insieme | Raspberry Pi | stabile |
-| [hikvision-isapi](hikvision-isapi/) | registratore DS-7608NXI-I2/S (V4.62), telecamera DS-2CD2347G2H-LI (V5.7.13-V5.7.23) | HTTP ISAPI (digest), RTSP | eventi delle telecamere -> ingressi virtuali di Loxone; ora, firmware, luce notturna, archivio volti; **riconoscimento facciale sul Raspberry** (OpenCV) | Raspberry Pi | eventi: stabile; volti: sperimentale |
+| [govee-bluetooth](govee-bluetooth/) | Govee H6126 (firmware 2.06.1) | Bluetooth LE (GATT, libreria bleak) | Loxone comanda le strisce LED: accensione, luminosita', colore, scene; piu' strisce insieme | Raspberry Pi | stabile |
+| [hikvision-isapi](hikvision-isapi/) | registratore DS-7608NXI-I2/S (V4.62), telecamera DS-2CD2347G2H-LI (V5.7.13-V5.7.23) | HTTP ISAPI (digest), RTSP | eventi delle telecamere -> ingressi virtuali di Loxone; ora, firmware, archivio volti; **riconoscimento facciale sul Raspberry** (OpenCV) | Raspberry Pi | eventi: stabile; volti: sperimentale |
 | [amazon-alexa](amazon-alexa/) | Amazon Smart Air Quality Monitor | cloud Alexa (aioamazondevices) | valori del sensore della qualita' dell'aria (PM2.5, PM10, VOC, CO, umidita', temperatura) -> ingresso virtuale HTTP di Loxone | Raspberry Pi | sperimentale |
 | Shelly (nel toolkit) | Shelly Gen1 e Gen2 | HTTP locale | cerca gli Shelly, assegna l'IP fisso previsto dal programma, li fa lampeggiare: `lox shelly` ([codice](../claudelox/shelly.py)) | PC | stabile |
 
-Per installare quelle che girano sul Raspberry: [`raspberry/`](../raspberry/).
+Per installare quelle che girano sul Raspberry: [`raspberry/`](../raspberry/) (`sudo bash raspberry/install.sh`). Ogni
+README dice il Python minimo: Govee 3.10, Hikvision 3.11, Amazon quello chiesto dalla sua libreria (provato con 3.13).
+Librerie e modelli di terzi: bleak (MIT), aioamazondevices (Apache 2.0), modelli dell'OpenCV Zoo YuNet (MIT) e
+SFace (Apache 2.0).
 
 ## Aggiungere un'integrazione
 
@@ -28,14 +31,19 @@ regole, che Claude segue (vedi `CLAUDE.md`) e che valgono anche per chi scrive a
 3. **Configurazione fuori dal codice**: un file in `/etc/...` o variabili d'ambiente, con un esempio
    (`*.example`). Le password le scrive la persona, con una procedura guidata, e non passano dalla chat.
 4. **Test senza il dispositivo** in `tests/test_<nome>.py`: pacchetti, risposte, decisioni. Devono passare con
-   `python -m unittest discover -s tests`.
+   `python -m unittest discover -s tests`; se l'integrazione vuole un Python piu' recente del toolkit (3.10), il
+   suo file di test si salta da solo sulle versioni vecchie e il README dice il Python minimo.
 5. **Sicurezza**: se l'integrazione puo' aprire porte, disinserire allarmi o comandare cancelli, deve avere una
-   modalita' di prova che scrive solo nel log (`dry_run`), conferme ripetute, una pausa tra due comandi, e va
-   attivata solo dopo le prove e con il consenso esplicito di chi abita la casa.
-6. **Servizio**: se gira sul Raspberry, un file `.service` di systemd nella cartella e una funzione in
+   modalita' di prova che scrive solo nel log (`dry_run`) ed e' quella di partenza anche quando non c'e' scritto
+   niente, conferme ripetute, una pausa tra due comandi, e va attivata solo dopo le prove e con il consenso
+   esplicito di chi abita la casa. Una chiave di configurazione sbagliata dev'essere un errore, non venire
+   ignorata. Se ascolta in rete, il README dice chi puo' parlarle e come limitarlo.
+6. **Servizio**: se gira sul Raspberry, un file `.service` di systemd nella cartella (utente non privilegiato e
+   le protezioni delle altre unita': `NoNewPrivileges`, `ProtectSystem`, `ProtectHome`...) e una funzione in
    `raspberry/install.sh`.
 7. **Licenza**: il codice e' MIT come il resto del progetto; modelli o librerie di terzi vanno scaricati
-   dall'origine ufficiale (con controllo sha256) e citati con la loro licenza.
+   dall'origine ufficiale (i file scaricati direttamente, come i modelli, con controllo sha256; le librerie dai
+   pacchetti del sistema o da PyPI) e citati con la loro licenza, nel README e dove si usano.
 
 Le integrazioni della tabella sono il punto di partenza: copiane lo stile (un file Python per il ponte, uno per
 la logica che si puo' provare senza dispositivo, un README che spiega tutto in italiano).

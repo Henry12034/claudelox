@@ -98,6 +98,16 @@ class PageTest(unittest.TestCase):
         self.assertFalse(al.allowed(None, allow))
         self.assertTrue(al.allowed("10.0.0.6", frozenset()))
 
+    def test_open_allow_from_is_said_at_startup(self):
+        """ALLOW_FROM vuoto resta il predefinito, ma il ponte dice che risponde a tutti e come restringerlo."""
+        with self.assertLogs("amazon-loxone", level="WARNING") as logs:
+            al.warn_if_open(al.Settings())
+        self.assertIn("ALLOW_FROM e' vuoto", logs.output[0])
+        self.assertIn("chiunque", logs.output[0])
+        self.assertIn("/etc/default/amazon-loxone", logs.output[0])
+        with self.assertNoLogs("amazon-loxone", level="WARNING"):
+            al.warn_if_open(al.Settings(allow_from=frozenset({"10.0.0.2"})))
+
 
 class SettingsTest(unittest.TestCase):
     def test_defaults_and_limits(self):
@@ -122,6 +132,17 @@ class LoginTest(unittest.TestCase):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             al.save_login(state, {"site": "senza token"})
             self.assertIsNone(al.load_login(state))
+
+
+class ServiceFileTest(unittest.TestCase):
+    def test_unit_is_hardened_and_keeps_its_state_directory(self):
+        lines = (Path(al.__file__).parent / "amazon-loxone.service").read_text(encoding="utf-8").splitlines()
+        for wanted in ("NoNewPrivileges=yes", "PrivateTmp=yes", "ProtectSystem=full", "ProtectHome=yes",
+                       "ProtectKernelTunables=yes", "ProtectKernelModules=yes", "ProtectControlGroups=yes",
+                       "RestrictSUIDSGID=yes", "LockPersonality=yes", "User=pi", "StateDirectory=amazon-loxone",
+                       "StateDirectoryMode=0700", "ConditionPathExists=/var/lib/amazon-loxone/accesso.json"):
+            self.assertIn(wanted, lines)
+        self.assertEqual([x for x in lines if x.startswith(("RestrictAddressFamilies", "DynamicUser"))], [])
 
 
 

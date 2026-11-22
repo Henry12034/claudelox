@@ -1,23 +1,29 @@
 # Configurazione del ponte telecamere Hikvision -> Loxone.
-# Sul Raspberry va in /etc/hikvision-loxone/config.toml, leggibile solo dal servizio (contiene password):
+# Sul Raspberry va in /etc/hikvision-loxone/config.toml, leggibile solo da root e dal gruppo dell'utente del
+# servizio (contiene password). Di solito la scrive la procedura guidata ("hikvision_loxone.py configura"); a mano:
 #   sudo install -d /etc/hikvision-loxone
-#   sudo install -m 0640 -g pi hikvision-loxone.example.toml /etc/hikvision-loxone/config.toml
+#   sudo install -m 0640 -g <gruppo dell'utente del servizio, es. pi> hikvision-loxone.example.toml /etc/hikvision-loxone/config.toml
 #   sudo nano /etc/hikvision-loxone/config.toml
 
+# Diagnostica (va scritta qui in cima, prima di [miniserver]): tiene documento e foto di TUTTI gli eventi dei
+# volti, anche delle persone sconosciute. Senza, si salvano solo quelli con una persona riconosciuta.
+# save_unknown_faces = true
+
 [miniserver]
-host = "192.168.1.10"            # IP del Miniserver
-user = ""                        # utente Loxone dedicato, con accesso agli ingressi virtuali usati
-password = ""
+host = "10.0.0.2"                # IP del Miniserver
+user = ""                        # utente Loxone dedicato, con i permessi minimi: mai un amministratore
+password = ""                    # (la password viaggia in chiaro nella rete di casa, HTTP Basic)
 # command = "SET(Sw;On;Pulse)"   # cosa scrivere nell'ingresso virtuale (predefinito)
 
 [[cameras]]
 name = "Esterna"
-host = "192.168.1.20"            # IP della telecamera
+host = "10.0.0.5"                # IP della telecamera
 user = ""                        # utente della telecamera
 password = ""
 
-# Una regola per ogni evento da girare a Loxone. Per vedere quali eventi, regioni e bersagli manda la
-# telecamera:  python3 /opt/claudelox-raspberry/hikvision_loxone.py eventi Esterna 120
+# Una regola per ogni evento da girare a Loxone. Una chiave sbagliata e' un errore: non viene ignorata.
+# Per vedere quali eventi, regioni e bersagli manda la telecamera:
+#   python3 /opt/claudelox-raspberry/hikvision_loxone.py eventi Esterna 120
 [[cameras.events]]
 type = "linedetection"           # attraversamento linea
 region = 1                       # facoltativo: numero della linea configurata sulla telecamera
@@ -26,28 +32,32 @@ target = "human"                 # facoltativo: human (persone) o vehicle (veico
 inputs = ["movimento_ingresso"]  # ingressi virtuali di Loxone da attivare
 # cooldown = 5                   # facoltativo: secondi minimi tra due comandi uguali
 
+# Le regole del riconoscimento facciale (quelle con "person" e quelle di tipo "volto") possono disinserire un
+# antifurto: vogliono min_similarity e restano in PROVA (scrivono nel log cosa farebbero, senza comandare
+# Loxone) finche' non c'e' scritto dry_run = false.
+
 # Riconoscimento facciale di un registratore (NVR) Hikvision: volto dell'archivio riconosciuto sul canale 2.
 # Si prepara con: hikvision_loxone.py volti aggiungi / volti motore / volti confronto (vedi README).
 # [[cameras.events]]
 # type = "faceContrast"
 # channel = 2
 # person = "Mario"               # nome della persona nell'archivio dei volti
-# min_similarity = 85            # somiglianza minima in percento
+# min_similarity = 85            # obbligatorio: somiglianza minima in percento
 # confirmations = 2              # riconosciuto in almeno 2 foto ...
 # window = 20                    # ... entro 20 secondi
 # inputs = ["mario_entrata"]
 # cooldown = 120
-# dry_run = true                 # prova: scrive nel log cosa farebbe, senza comandare Loxone
+# dry_run = true                 # prova (e' cosi' anche senza questa riga); false solo dopo le prove
 
 # Riconoscimento facciale sul Raspberry con le foto della telecamera (vedi README, "volti-locali impara").
 # [[cameras.events]]
 # type = "volto"
 # target = "human"               # parte quando la telecamera segnala una persona (intrusione o linea)
 # continuous = true              # oppure: analisi continua delle foto, senza aspettare gli avvisi
-# person = "Mario"
-# min_similarity = 45            # coseno in percento
+# person = "Mario"               # obbligatorio: la persona da riconoscere
+# min_similarity = 45            # obbligatorio: coseno in percento, almeno 36.3 (la soglia di SFace)
 # confirmations = 2              # foto in cui deve essere riconosciuto
 # window = 8                     # secondi di foto
 # inputs = ["mario_entrata"]
 # cooldown = 120
-# dry_run = true
+# dry_run = true                 # prova (e' cosi' anche senza questa riga); false solo dopo le prove

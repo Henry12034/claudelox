@@ -1,6 +1,8 @@
 # Amazon Alexa (cloud): sensore della qualita' dell'aria in Loxone
 
-Stato: sperimentale. Gira su: Raspberry Pi. Servizio: `amazon-loxone.service`.
+Stato: sperimentale. Gira su: Raspberry Pi. Servizio: `amazon-loxone.service`. Python: provato con 3.13
+(Raspberry Pi OS trixie); il minimo lo decide la libreria aioamazondevices, che vuole un Python recente (vedi
+"Limiti noti").
 
 L'**Amazon Smart Air Quality Monitor** non ha nessun accesso locale: misura polveri sottili, composti organici
 volatili, monossido di carbonio, umidita' e temperatura e manda tutto solo al cloud di Amazon (lo mostra l'app
@@ -18,7 +20,7 @@ Alexa, un Raspberry (o un altro Linux sempre acceso) e l'accesso all'account Ama
 
 - **Nessuna interfaccia locale**: in rete il sensore non apre nessuna porta TCP (provate 1-10000 e le porte IoT
   comuni). I valori si leggono solo dal cloud di Amazon.
-- **Libreria**: [aioamazondevices](https://github.com/chemelli74/aioamazondevices) (Apache 2.0), la stessa
+- **Libreria**: [aioamazondevices](https://github.com/chemelli74/aioamazondevices) (licenza Apache 2.0), la stessa
   dell'integrazione ufficiale "Alexa Devices" di Home Assistant, con la versione fissata in `raspberry/install.sh`
   (Amazon cambia spesso le sue interfacce: si aggiorna dopo una prova). Il sensore e' il tipo `AEZME1X38KDRA`;
   i valori arrivano come sensori della libreria: `Air Quality` (indice Amazon, piu' alto = aria migliore),
@@ -62,12 +64,13 @@ esempio quello del meteo; poi `lox carica` lo porta sul Miniserver, struttura de
 ## Installazione e configurazione
 
 ```bash
-sudo raspberry/install.sh amazon-alexa
+sudo bash raspberry/install.sh amazon-alexa
 ```
 
 Configurazione in `/etc/default/amazon-loxone` (esempio in `amazon-loxone.env.example`): `HTTP_PORT` (8095),
-`ALLOW_FROM` (IP ammessi: il Miniserver e 127.0.0.1), `INTERVAL_S` (300), `DEVICE`. L'accesso ad Amazon lo
-fa la persona, in un terminale del Raspberry (o con un file sul Desktop che apre `ssh -t`):
+`ALLOW_FROM` (IP ammessi: il Miniserver e 127.0.0.1; vuoto = tutti), `INTERVAL_S` (300), `DEVICE`. L'accesso ad
+Amazon lo fa la persona, come utente dei servizi (di solito quello che ha lanciato `sudo`), in un terminale del
+Raspberry (o con un file sul Desktop che apre `ssh -t`):
 
 ```bash
 /opt/claudelox-raspberry/venv/bin/python /opt/claudelox-raspberry/amazon_loxone.py accedi && sudo systemctl restart amazon-loxone
@@ -75,14 +78,18 @@ fa la persona, in un terminale del Raspberry (o con un file sul Desktop che apre
 
 ## Comandi
 
+Il programma gira con il Python dell'ambiente preparato da `install.sh` (li' c'e' la libreria):
+
 ```bash
-amazon_loxone.py accedi      # accesso ad Amazon (una volta sola), poi mostra i sensori trovati
-amazon_loxone.py leggi       # legge i valori da Amazon e li stampa
-amazon_loxone.py run         # il ponte (servizio systemd)
-amazon_loxone.py esci        # cancella i dati di accesso salvati
-curl http://127.0.0.1:8095/aria     # la pagina che legge il Miniserver
+P=/opt/claudelox-raspberry/venv/bin/python; A=/opt/claudelox-raspberry/amazon_loxone.py
+$P $A accedi                        # accesso ad Amazon (una volta sola), poi mostra i sensori trovati
+$P $A leggi                         # legge i valori da Amazon e li stampa
+$P $A esci                          # cancella i dati di accesso salvati
+curl http://127.0.0.1:8095/aria     # la pagina che legge il Miniserver (127.0.0.1 deve essere tra gli IP ammessi)
 journalctl -u amazon-loxone -f      # una riga con i valori a ogni lettura
 ```
+
+`run` e' il ponte: lo avvia il servizio.
 
 ## Sicurezza e privacy
 
@@ -91,19 +98,28 @@ journalctl -u amazon-loxone -f      # una riga con i valori a ogni lettura
   dall'utente del servizio: valgono come un'app Alexa collegata all'account. Per revocarli: `esci` e poi elimina
   il dispositivo "AioAmazonDevices" da Amazon > Gestisci contenuti e dispositivi.
 - I messaggi di debug della libreria (che possono contenere codici di accesso) restano spenti.
-- La pagina per il Miniserver risponde solo agli IP in `ALLOW_FROM`.
+- La pagina per il Miniserver e' HTTP **senza autenticazione**: con `ALLOW_FROM` vuoto (e' il predefinito)
+  **chiunque sia collegato alla rete di casa puo' leggere i valori del sensore**; il ponte lo scrive nel log a ogni
+  avvio. Per limitarla: `ALLOW_FROM=<IP del Miniserver>,127.0.0.1` in `/etc/default/amazon-loxone` (agli altri
+  risponde 403).
+- Il servizio gira senza privilegi, con le protezioni di systemd dell'unita' (`NoNewPrivileges`, `ProtectSystem`,
+  `ProtectHome`...); i programmi in `/opt/claudelox-raspberry` sono di root.
 - Il monossido di carbonio di questo sensore non sostituisce un rilevatore certificato.
 
 ## Test
 
 `tests/test_amazon_loxone.py`: valori dai sensori della libreria (errori, gradi Fahrenheit), pagina per Loxone
-(online, eta), scelta del sensore, IP ammessi, salvataggio dei dati di accesso, accesso passo per passo con
-pagine di Amazon finte (codice chiesto dopo la password e ripetibile, account senza verifica, pagina sconosciuta
-descritta senza dati riservati).
+(online, eta), scelta del sensore, IP ammessi (e avviso quando sono tutti), salvataggio dei dati di accesso,
+accesso passo per passo con pagine di Amazon finte (codice chiesto dopo la password e ripetibile, account senza
+verifica, pagina sconosciuta descritta senza dati riservati; questi si saltano se manca beautifulsoup4).
 
 ## Limiti noti
 
 - Dipende da internet e da Amazon: interfaccia non ufficiale, puo' smettere di funzionare finche' la libreria
   non si aggiorna.
+- Provato solo su Raspberry Pi OS trixie (Python 3.13). La libreria aioamazondevices vuole un Python recente (il
+  minimo e' il `requires-python` della versione fissata in `raspberry/install.sh`): su Bookworm (Python 3.11) il
+  ponte non e' stato provato e `pip` potrebbe rifiutare di installarla. Il codice del ponte e i suoi test girano
+  anche con Python 3.10.
 - I valori arrivano con qualche minuto di ritardo (lettura ogni 5 minuti, misura del sensore gia' vecchia di 1-3).
 - Gli account con approvazione dall'app o con captcha all'accesso non sono gestiti: si riprova piu' tardi.

@@ -2,9 +2,10 @@
 """Ponte sensore della qualita' dell'aria Amazon -> Loxone, pensato per un Raspberry Pi.
 
 L'"Amazon Smart Air Quality Monitor" non ha un accesso locale: manda i valori solo al cloud Amazon (li
-mostra l'app Alexa). Questo ponte li legge da li' con la libreria aioamazondevices (la stessa
-dell'integrazione ufficiale "Alexa Devices" di Home Assistant) e li offre in rete locale come pagina di
-testo, che il Miniserver legge con un ingresso virtuale HTTP:
+mostra l'app Alexa). Questo ponte li legge da li' con la libreria aioamazondevices (licenza Apache 2.0,
+https://github.com/chemelli74/aioamazondevices: la stessa dell'integrazione ufficiale "Alexa Devices" di
+Home Assistant) e li offre in rete locale come pagina di testo, che il Miniserver legge con un ingresso
+virtuale HTTP:
 
   GET http://<raspberry>:8095/aria      online=1
                                         qualita=95
@@ -19,7 +20,8 @@ l'ultimo. /aria/<n> mostra l'n-esimo sensore dell'account (in ordine di nome), /
 
 Configurazione da variabili d'ambiente (sul Raspberry: /etc/default/amazon-loxone):
   HTTP_PORT     porta della pagina (8095)
-  ALLOW_FROM    IP ammessi, separati da virgola (vuoto = tutti): di solito il Miniserver e 127.0.0.1
+  ALLOW_FROM    IP ammessi, separati da virgola: di solito il Miniserver e 127.0.0.1 (vuoto = tutti: la pagina
+                risponde a chiunque in rete, e il ponte lo scrive all'avvio)
   INTERVAL_S    ogni quanti secondi chiedere i valori ad Amazon (300, minimo 60)
   DEVICE        nome del sensore nell'app Alexa o numero di serie (vuoto = il primo)
   STATE_DIR     cartella dei dati di accesso (/var/lib/amazon-loxone)
@@ -179,6 +181,14 @@ def allowed(remote: str | None, allow: frozenset[str]) -> bool:
     if remote and remote.startswith("::ffff:"):
         remote = remote[7:]
     return remote in allow
+
+
+def warn_if_open(settings: Settings) -> None:
+    """ALLOW_FROM vuoto resta il predefinito, ma all'avvio si dice chiaro cosa vuol dire e come restringerlo."""
+    if not settings.allow_from:
+        log.warning("ALLOW_FROM e' vuoto: la pagina con i valori del sensore risponde a chiunque in rete. Per "
+                    "limitarla scrivi in /etc/default/amazon-loxone ALLOW_FROM=<IP del Miniserver>,127.0.0.1 e "
+                    "riavvia il servizio")
 
 
 # --- dati di accesso ----------------------------------------------------------------------------------
@@ -483,6 +493,7 @@ async def cmd_run(settings: Settings) -> int:
     await web.TCPSite(runner, "0.0.0.0", settings.port).start()
     log.info("pagina per Loxone su http://<raspberry>:%d/aria, valori da Amazon ogni %d s (ammessi: %s)",
              settings.port, settings.interval_s, ", ".join(sorted(settings.allow_from)) or "tutti")
+    warn_if_open(settings)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

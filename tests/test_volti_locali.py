@@ -5,6 +5,9 @@ import sys
 import unittest
 from pathlib import Path
 
+if sys.version_info < (3, 11):      # hikvision_loxone.py legge la configurazione con tomllib
+    raise unittest.SkipTest("l'integrazione Hikvision richiede Python 3.11 o successivo (tomllib)")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "integrazioni" / "hikvision-isapi"))
 
 import hikvision_loxone as hk  # noqa: E402
@@ -119,6 +122,37 @@ dry_run = true
         self.assertEqual(again, rule)
         self.assertIn("riconoscimento sul Raspberry dopo intrusione/attraversamento linea", hk.describe_rule(rule))
         self.assertIn("2 conferme in 8 s", hk.describe_rule(rule))
+
+    def test_volto_rule_needs_person_and_a_sensible_similarity(self):
+        """Una regola "volto" puo' disinserire un antifurto: persona e soglia vanno scritte, la soglia ha un minimo."""
+        base = {"type": "volto", "person": "Mario", "min_similarity": 45, "inputs": ["mario_entrata"]}
+        with self.assertRaisesRegex(ValueError, "vuole 'person'"):
+            hk.rule_from_dict({k: v for k, v in base.items() if k != "person"})
+        with self.assertRaisesRegex(ValueError, "'min_similarity' scritto"):
+            hk.rule_from_dict({k: v for k, v in base.items() if k != "min_similarity"})   # prima: attiva allo 0%
+        with self.assertRaisesRegex(ValueError, "maggiore di 0"):
+            hk.rule_from_dict({**base, "min_similarity": 0})
+        lowest = round(vl.SAME_PERSON * 100, 4)                  # la soglia di SFace, in percento
+        self.assertEqual(hk.local_face_min_similarity(), lowest)
+        for low in (20, lowest - 0.1, 0.45):                     # 0.45 = coseno scritto al posto del percento
+            with self.assertRaises(ValueError) as ctx:
+                hk.rule_from_dict({**base, "min_similarity": low})
+            self.assertIn(f"almeno {lowest:g}", str(ctx.exception))     # l'errore dice il minimo
+        self.assertEqual(hk.rule_from_dict({**base, "min_similarity": lowest}).min_similarity, lowest)
+
+    def test_volto_rule_starts_in_test_mode_and_live_survives_save(self):
+        without = self.CONFIG.replace("dry_run = true\n", "")
+        ms, cams = hk.load_config(without)
+        self.assertTrue(cams[0].rules[0].dry_run)                 # senza dry_run nel file: prova
+        self.assertIn("dry_run = true", hk.dump_config(ms, cams))
+        live = self.CONFIG.replace("dry_run = true", "dry_run = false").replace("confirmations = 2\n", "")
+        ms, cams = hk.load_config(live)
+        rule = cams[0].rules[0]
+        self.assertEqual((rule.dry_run, rule.confirmations, rule.window), (False, 1, 8.0))
+        text = hk.dump_config(ms, cams)
+        self.assertIn("dry_run = false", text)                    # scritto sempre: se no tornerebbe in prova
+        self.assertIn("window = 8", text)                         # con una conferma prima spariva (tornava 20)
+        self.assertEqual(hk.load_config(text)[1][0].rules[0], rule)
 
     def test_continuous_rule(self):
         ms, cams = hk.load_config(self.CONFIG.replace('type = "volto"', 'type = "volto"\ncontinuous = true'))

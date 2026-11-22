@@ -6,6 +6,7 @@ Wants=network-online.target
 ConditionPathExists=/var/lib/amazon-loxone/accesso.json
 
 [Service]
+# utente del servizio: raspberry/install.sh mette qui quello scelto (SERVICE_USER); nel repository e' "pi"
 User=pi
 EnvironmentFile=/etc/default/amazon-loxone
 # /var/lib/amazon-loxone: dati di accesso ad Amazon, leggibili solo dall'utente del servizio
@@ -15,6 +16,16 @@ ExecStart=/opt/claudelox-raspberry/venv/bin/python /opt/claudelox-raspberry/amaz
 Restart=always
 # a ogni avvio il ponte chiede ad Amazon l'elenco dei dispositivi: niente ripartenze a raffica
 RestartSec=60
+# protezioni prudenti: il servizio non acquista privilegi e non scrive nel sistema ne' nelle cartelle personali
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -5,13 +5,24 @@ Wants=network-online.target
 ConditionPathExists=/etc/hikvision-loxone/config.toml
 
 [Service]
+# utente del servizio: raspberry/install.sh mette qui quello scelto (SERVICE_USER); nel repository e' "pi"
 User=pi
-# /var/lib/hikvision-loxone: documenti e foto degli ultimi eventi del riconoscimento facciale
+# /var/lib/hikvision-loxone: impronte dei volti noti, documento e foto degli ultimi volti riconosciuti
 StateDirectory=hikvision-loxone
 StateDirectoryMode=0750
 ExecStart=/usr/bin/python3 /opt/claudelox-raspberry/hikvision_loxone.py run
 Restart=always
 RestartSec=10
+# protezioni prudenti: il servizio non acquista privilegi e non scrive nel sistema ne' nelle cartelle personali
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

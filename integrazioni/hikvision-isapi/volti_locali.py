@@ -4,8 +4,8 @@ Serve con le telecamere che inquadrano dall'alto, dove il rilevatore dei registr
 trova anche piccoli (da ~40 px) e di sbieco nelle foto a piena risoluzione della telecamera. I volti noti sono
 salvati come "impronte" (128 numeri per foto), non come immagini, in KNOWN_PATH.
 
-Modelli dell'OpenCV Zoo (licenza Apache 2.0, https://github.com/opencv/opencv_zoo), in MODEL_DIR; install.sh li
-scarica e ne controlla l'impronta sha256.
+Modelli dell'OpenCV Zoo (https://github.com/opencv/opencv_zoo: YuNet con licenza MIT, SFace con licenza
+Apache 2.0), in MODEL_DIR; install.sh li scarica e ne controlla l'impronta sha256.
 """
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ RECOGNIZER = "face_recognition_sface_2021dec.onnx"
 MODEL_SHA256 = {DETECTOR: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
                 RECOGNIZER: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"}
 KNOWN_PATH = os.path.join(os.environ.get("STATE_DIRECTORY", "/var/lib/hikvision-loxone"), "volti-noti.npz")
-SAME_PERSON = 0.363      # soglia di SFace (coseno) per "stessa persona"; per un antifurto se ne usa una piu' alta
+# soglia di SFace (coseno) per "stessa persona"; per un antifurto se ne usa una piu' alta. In percento e' il
+# minimo che hikvision_loxone.py accetta come min_similarity di una regola "volto"
+SAME_PERSON = 0.363
 MIN_FACE_PX = 36         # volti piu' piccoli danno impronte poco affidabili: non contano
 PHOTO_GAP_S = 0.25       # pausa tra due foto della raffica
 
