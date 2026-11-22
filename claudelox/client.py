@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import re
 import struct
 import time
 import urllib.parse
 import urllib.request
 import uuid as uuidlib
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 
 import websocket
 
@@ -66,6 +69,14 @@ class LoxoneError(Exception):
 
 class AuthError(LoxoneError):
     pass
+
+
+class HttpError(LoxoneError):
+    """Un download HTTP rifiutato: `status` distingue un file che non c'e' (404) da un errore."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
 
 
 def ll_code(ll: dict) -> int:
@@ -177,9 +188,22 @@ def load_token(host: str, user: str) -> Token | None:
     return tok if (tok.host == host and tok.user == user) else None
 
 
+def write_private(path, text: str) -> None:
+    """Scrive un file che deve leggere solo il proprietario (il token): su Linux e macOS con permessi 600.
+
+    Su Windows i permessi sono quelli della cartella dell'utente (chmod non ha effetto)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(path, 0o600)  # anche se il file esisteva gia' con permessi piu' larghi
+        return
+    path.write_text(text, encoding="utf-8")
+
+
 def save_token(tok: Token) -> None:
-    STATE_DIR.mkdir(exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(asdict(tok), indent=2), encoding="utf-8")
+    write_private(TOKEN_FILE, json.dumps(asdict(tok), indent=2))
 
 
 def delete_token() -> None:
@@ -193,9 +217,47 @@ def client_uuid() -> str:
     except (OSError, ValueError, KeyError):
         h = uuidlib.uuid4().hex
         uid = f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:32]}"
-        STATE_DIR.mkdir(exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         CLIENT_FILE.write_text(json.dumps({"uuid": uid}), encoding="utf-8")
         return uid
+
+
+# ------------------------------------------------------------ elenco dei file
+
+LISTING_RE = re.compile(r"^([d-])\s+(\d+)\s+(\S+\s+\d+\s+[\d:]+)\s+(.+?)\s*$")
+
+
+def parse_file_listing(text: str) -> list[dict]:
+    """Elenco di una cartella come lo da' il Miniserver via HTTP (dev/fslist): una riga per voce,
+    "d|-  dimensione  data  nome". Una cartella vuota o che non esiste risponde "Directory empty"."""
+    out = []
+    for line in text.splitlines():
+        m = LISTING_RE.match(line.strip())
+        if m and m.group(4) not in (".", ".."):
+            out.append({"filename": m.group(4), "size": int(m.group(2)), "dir": m.group(1) == "d",
+                        "date": m.group(3)})
+    return out
+
+
+MONTHS = {name: i for i, name in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
+
+
+def listing_time(text: str, now: datetime | None = None) -> datetime | None:
+    """Data di una voce dell'elenco ("Nov 21 22:29": ora locale del Miniserver, senza anno e senza secondi).
+
+    L'anno e' il piu' recente che non porta nel futuro. None se il testo non ha questa forma."""
+    m = re.match(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2})$", (text or "").strip())
+    if not m or m.group(1).title() not in MONTHS:
+        return None
+    now = now or datetime.now()
+    for year in (now.year, now.year - 1):
+        try:
+            t = datetime(year, MONTHS[m.group(1).title()], int(m.group(2)), int(m.group(3)), int(m.group(4)))
+        except ValueError:  # 29 febbraio di un anno non bisestile, ora non valida
+            continue
+        if t <= now + timedelta(days=1):
+            return t
+    return None
 
 
 # ------------------------------------------------------------------ client
@@ -260,11 +322,14 @@ class Miniserver:
             raise AuthError("manca LOXONE_USER nel file .env")
         tok = load_token(self.s.host, user)
         if tok and tok.seconds_left() > 60:
-            if self._auth_with_token(tok):
+            code = self._auth_with_token(tok)
+            if code == 200:
                 self.token = tok
                 if tok.seconds_left() < REFRESH_BELOW:
                     self._refresh(tok)
                 return
+            if code == 429 or code == 901 or code >= 500:  # Miniserver occupato: il token puo' essere ancora buono
+                raise AuthError(f"il Miniserver ora non accetta il login ({explain(code)}): riprova tra poco")
             delete_token()
         if not self.s.password:
             raise AuthError("nessun token valido salvato: esegui 'lox login' (ti chiede la password) "
@@ -277,10 +342,10 @@ class Miniserver:
             raise AuthError(f"getkey fallito ({explain(ll_code(ll))})")
         return str(ll["value"])
 
-    def _auth_with_token(self, tok: Token) -> bool:
+    def _auth_with_token(self, tok: Token) -> int:
         h = crypto.token_hash(tok.token, self._getkey(), tok.hash_alg)
         ll = self.request(self.session.wrap(f"authwithtoken/{h}/{urllib.parse.quote(tok.user, safe='')}"))
-        return ll_code(ll) == 200
+        return ll_code(ll)
 
     def login_with_password(self, user: str, password: str, permission: int | None = None,
                             persist: bool = True) -> Token:
@@ -475,19 +540,22 @@ class Miniserver:
         """
         if not self.token:
             raise AuthError("serve il login (token) per scaricare file")
-        conn = http.client.HTTPConnection(self.s.host, 80, timeout=timeout)
+        quoted = urllib.parse.quote(path.lstrip("/"), safe="/:()[];,=+-_.~!*'%")  # nomi di file con spazi
+        conn = http.client.HTTPConnection(self.s.host, timeout=timeout)  # porta 80, o quella scritta in LOXONE_HOST
         try:
             conn.request("GET", "/jdev/sys/getkey")
             key = json.loads(conn.getresponse().read().decode("utf-8", "replace"))["LL"]["value"]
             h = crypto.token_hash(self.token.token, str(key), self.token.hash_alg)
             query = urllib.parse.urlencode({"autht": h, "user": self.token.user})
-            conn.request("GET", f"/{path.lstrip('/')}?{query}")
+            conn.request("GET", f"/{quoted}?{query}")
             resp = conn.getresponse()
             data = resp.read()
+        except (http.client.HTTPException, ValueError, KeyError, TypeError) as e:
+            raise LoxoneError(f"download di {path} non riuscito (risposta non valida dal Miniserver: {e})") from e
         finally:
             conn.close()
         if resp.status != 200:
-            raise LoxoneError(f"download di {path} rifiutato (HTTP {resp.status})")
+            raise HttpError(f"download di {path} rifiutato (HTTP {resp.status})", resp.status)
         return data
 
     def connect_admin(self, rights: int = ADMIN_OPS_PERMISSION) -> "Miniserver":
@@ -510,21 +578,48 @@ class Miniserver:
         """Riavvia la logica del Miniserver (dev/sps/restart): carica /prog/sps_new.zip se presente.
 
         Richiede i diritti Sys-WS. Il riavvio e' breve (~10 s) ma interrompe la logica di casa.
-        La connessione viene quasi sempre chiusa dal Miniserver durante il riavvio.
+        La connessione viene quasi sempre chiusa dal Miniserver durante il riavvio (con o senza saluto): da qui
+        in poi non si puo' sapere se il comando e' arrivato, quindi chi chiama deve verificare il programma attivo.
         """
         try:
             return self.request("jdev/sps/restart", timeout=20)
-        except LoxoneError:
+        except (LoxoneError, OSError, websocket.WebSocketException):
             return {"Code": "200", "value": "restart (connessione chiusa dal Miniserver)"}
 
     def list_files(self, folder: str) -> list[dict]:
-        """Elenco dei file di una cartella della scheda SD (dev/fslist)."""
-        ll = self.request(f"dev/fslist/{folder.strip('/')}")
-        if ll_code(ll) != 200:
-            raise LoxoneError(f"impossibile elencare /{folder} ({explain(ll_code(ll))})")
-        value = ll.get("value")
-        data = value if isinstance(value, dict) else loose_json(value)
-        return data.get("content", [])
+        """Elenco dei file di una cartella della scheda SD (dev/fslist): voci con almeno "filename".
+
+        Fino al firmware 17.2 l'elenco arriva via WebSocket (JSON). Dal 17.3 (misurato il 22/11/2026 sul
+        17.3.11.12) via WebSocket arriva sempre vuoto, con qualsiasi diritto del token: lo stesso comando via
+        HTTP restituisce invece un elenco di testo. Una cartella che non esiste risulta vuota; se l'elenco non si
+        riesce a leggere e' un errore, mai "cartella vuota": da qui dipendono i controlli prima di un caricamento.
+        """
+        folder = folder.strip("/")
+        content, problem = [], None
+        ll = self.request(f"dev/fslist/{folder}")
+        if ll_code(ll) == 200:
+            value = ll.get("value")
+            try:
+                data = value if isinstance(value, dict) else loose_json(value)
+                content = data.get("content", []) if isinstance(data, dict) else []
+            except (TypeError, ValueError):
+                content = []
+        else:
+            problem = LoxoneError(f"impossibile elencare /{folder} ({explain(ll_code(ll))})")
+        if content:
+            return content
+        try:
+            text = self.http_download(f"dev/fslist/{folder}", timeout=20).decode("utf-8", "replace")
+        except HttpError as e:
+            if e.status == 404 and not problem:
+                return []  # la cartella non esiste
+            raise problem or LoxoneError(f"impossibile elencare /{folder} (HTTP {e.status})")
+        except (LoxoneError, OSError) as e:
+            raise problem or LoxoneError(f"impossibile elencare /{folder} ({e})")
+        if text.strip().lower() != "directory empty" and not any(LISTING_RE.match(ln.strip())
+                                                                 for ln in text.splitlines()):
+            raise LoxoneError(f"elenco di /{folder} in un formato sconosciuto (firmware nuovo?)")
+        return parse_file_listing(text)
 
     def structure(self, refresh: bool = False) -> dict:
         """File di struttura LoxAPP3.json, con cache locale aggiornata quando cambia."""
@@ -536,6 +631,6 @@ class Miniserver:
         payload = self.download("data/LoxAPP3.json")
         text = payload if isinstance(payload, str) else payload.decode("utf-8", "replace")
         data = json.loads(text)
-        STATE_DIR.mkdir(exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         STRUCTURE_CACHE.write_text(text, encoding="utf-8")
         return data

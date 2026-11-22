@@ -5,8 +5,11 @@ Usano un piccolo programma sintetico (nessun dato di un impianto reale).
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
 import io
 import json
+import re
 import struct
 import sys
 import tempfile
@@ -15,13 +18,18 @@ import zipfile
 import zlib
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from claudelox import appstructure, editor, uploader  # noqa: E402
+from claudelox import appstructure, backups, cli, config, editor, uploader  # noqa: E402
 from claudelox.cli import activation_outcome  # noqa: E402
+from claudelox.client import HttpError, LoxoneError, Miniserver, listing_time, parse_file_listing  # noqa: E402
+from claudelox.config import Settings  # noqa: E402
 from claudelox.loxcc import MAGIC, decompress, read_program  # noqa: E402
-from claudelox.program import Program, app_impact, diff, set_parameter  # noqa: E402
+from claudelox.program import (Program, access_changes, app_impact, custom_change, diff, redact,  # noqa: E402
+                               redact_data, set_parameter)
+from claudelox.structure import Structure  # noqa: E402
 
 U = "1c000000-0000-{:04x}-ffff000000000000".format  # UUID sintetici nel formato Loxone 8-4-4-16
 DOOR, DOOR_Q, PAGE, REF, REF_AI, REF_AQ = U(1), U(2), U(3), U(4), U(5), U(6)
@@ -159,6 +167,35 @@ class EditorTest(unittest.TestCase):
         new = Program(text.encode("utf-8"))
         self.assertEqual(new.parent[new.by_uuid[inner_u]].get("U"), block_u)
         self.assertNotIn("IoData", editor.clone_block(prog.block("Luci"), ids)[0])  # senza elements: come prima
+
+    def test_clone_group_rewires_inside_and_keeps_outside(self):
+        ids = editor.UuidFactory(SAMPLE)
+        blocks, mapping = editor.clone_group(SAMPLE, [REF, PULSE, LIGHT], ids, offset=(1000, 2000))
+        text = editor.bump_counters(editor.insert_children(SAMPLE, PAGE, blocks), 3)
+        self.assertNotIn("\r\r", text)
+        new = Program(text.encode("utf-8"))
+        ref, pulse, light = (new.by_uuid[mapping[u]] for u in (REF, PULSE, LIGHT))
+        self.assertEqual(ref.get("Ref"), DOOR)                                     # riferimento esterno: uguale
+        self.assertEqual(new.wiring(ref)["ingressi"], ["AI <- Porta.Q <DigitalIn>"])
+        trig = next(co for co in pulse.findall("Co") if co.get("K") == "InputTrigger")
+        self.assertEqual((trig.find("In").get("Input"), trig.get("Inv")), (mapping[REF_AQ], "true"))  # interno: copia
+        self.assertEqual(new.wiring(light)["ingressi"], ["On <- Altro.Q <Memory>"])  # da fuori: come l'originale
+        self.assertEqual(light.find("IoData").get("Pr"), ROOM)                    # contenuto copiato
+        self.assertEqual((pulse.get("Px"), pulse.get("Py2")), ("1300", "2070"))
+        self.assertEqual(new.parent[pulse].get("U"), PAGE)
+        self.assertEqual(new.wiring(new.by_uuid[PULSE])["ingressi"], ["InputTrigger <- Porta.AQ <InputRef>"])
+        self.assertEqual(len(set(mapping.values())), len(mapping))
+        self.assertTrue(all(text.count(f'U="{u}"') == 1 for u in mapping.values()))
+        with self.assertRaises(editor.EditError):
+            editor.clone_group(SAMPLE, [U(20)], ids)                              # contenitore: no
+
+    def test_set_child_attr_changes_only_the_own_element(self):
+        text = SAMPLE.replace(f'<IoData Pr="{ROOM}" Visu="true"/>',
+                              f'<IoData Pr="{ROOM}" Visu="true"/>\r\n\t\t\t\t<LoggerMailer On="Vecchio" NL="1"/>')
+        text = editor.set_child_attr(text, LIGHT, "LoggerMailer", {"On": "Nuovo testo"})
+        self.assertIn('<LoggerMailer On="Nuovo testo" NL="1"/>', text)
+        with self.assertRaises(editor.EditError):
+            editor.set_child_attr(text, PULSE, "LoggerMailer", {"On": "x"})
 
     def test_set_parameter_changes_only_value(self):
         new = set_parameter(SAMPLE.encode("utf-8"), PULSE_TIME, "0.5").decode("utf-8")
@@ -382,6 +419,14 @@ class AppStructureTest(unittest.TestCase):
         self.assertEqual((upd.unsupported, list(json.loads(upd.data)["controls"])), ([], [f"U:{CMD2}"]))
         self.assertEqual(upd.permissions, perm_record(CAL, [], [], extra=[]) + HTTP_PERMS[-160:])
 
+    def test_hidden_control_still_used_by_another_is_left_to_config(self):
+        app = json.loads(HTTP_APP)
+        app["controls"][f"U:{CMD2}"]["details"]["controls"] = [{"uuid": CMD}]      # come un comando centrale
+        hidden = editor.set_iodata(HTTP_SAMPLE, CMD, {"Visu": None})
+        upd = appstructure.update_app(Program(HTTP_SAMPLE.encode("utf-8")), Program(hidden.encode("utf-8")),
+                                      appstructure.dump(app).encode("utf-8"), HTTP_PERMS, now=NOW)
+        self.assertTrue(any("ancora usati" in x for x in upd.unsupported))
+
     def test_hidden_value_does_not_touch_the_app(self):
         text, _, _ = add_cmd(HTTP_SAMPLE, "Nascosto", "<v>", ROOM, visible=False)
         upd = self.update(text)
@@ -418,6 +463,100 @@ class AppStructureTest(unittest.TestCase):
         self.assertIsNone(uploader.read_member(built, "manca.bin"))
 
 
+# controllo luci con due circuiti (dimmer e colore), un dimmer collegato (linkC) e un valore solo tra i preferiti
+LC, LC_SCENE, DIM, DIM_AQ, FAVONLY, LROOM, LCAT, G_LROOM, G_LCAT, LUSER = (U(i) for i in range(70, 80))
+LIGHT_SAMPLE = f"""<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1" NextObj="100">
+\t<C Type="Document" U="{U(0)}" Title="Prova" NumO="4">
+\t\t<C Type="Page" U="{PAGE}" Title="Camera">
+\t\t\t<C Type="LightController2" Desc="Led camera" U="{LC}" Title="Luci camera" linkC="{DIM}" NameAI0="Led" NameAI1="Scena luce RGB" PresM0="65535">
+\t\t\t\t<Co K="Scene" U="{LC_SCENE}"/>
+\t\t\t\t<LightscenesC Outputs="2" Num="1">
+\t\t\t\t\t<LightsceneC Name="Off" UUID="{U(81)}" ReadOnly="true" Outputs="2" SID="778" CID="11" Q1="268435456" Q2="1073741824"/>
+\t\t\t\t</LightscenesC>
+\t\t\t\t<IoData Visu="true" Cr="{LCAT}" Pr="{LROOM}" Rating="8"/>
+\t\t\t</C>
+\t\t\t<C Type="PushDimmer" U="{DIM}" Title="Luminosita led">
+\t\t\t\t<Co K="AQ" U="{DIM_AQ}"/>
+\t\t\t\t<IoData Visu="true" Cr="{LCAT}" Pr="{LROOM}" Rating="9"/>
+\t\t\t</C>
+\t\t\t<C Type="LightsceneRGB" U="{FAVONLY}" Title="Scena luce RGB">
+\t\t\t\t<IoData Cr="{LCAT}" Pr="{LROOM}" UseInFav="true"/>
+\t\t\t</C>
+\t\t</C>
+\t</C>
+</ControlList>
+"""
+LIGHT_APP = json.dumps({"lastModified": "2026-01-01 10:00:00", "rooms": {LROOM: {"uuid": LROOM, "name": "Camera"}},
+                        "cats": {LCAT: {"uuid": LCAT, "name": "Luci"}}, "controls": {
+    f"U:{LC}": {"name": "Led camera", "type": "LightControllerV2", "uuidAction": LC, "room": LROOM, "cat": LCAT,
+                "defaultRating": 8, "isFavorite": False, "isSecured": False, "restrictions": 0, "details": {},
+                "states": {}, "links": [DIM], "subControls": {
+                    f"{LC}/masterValue": {"name": "Luminosita Generale", "type": "Dimmer"},
+                    f"{LC}/AI1": {"name": "Led", "type": "Dimmer"},
+                    f"{LC}/AI2": {"name": "Scena luce RGB", "type": "ColorPickerV2"}}},
+    f"U:{DIM}": {"name": "Luminosita led", "type": "Dimmer", "uuidAction": DIM, "room": LROOM, "cat": LCAT,
+                 "defaultRating": 9, "isFavorite": False, "isSecured": False, "defaultIcon": None, "restrictions": 0,
+                 "states": {}},
+    f"U:{FAVONLY}": {"name": "Scena luce RGB", "type": "LightsceneRGB", "uuidAction": FAVONLY, "room": LROOM,
+                     "cat": LCAT, "defaultRating": 0, "isFavorite": True, "isSecured": False, "restrictions": 17,
+                     "details": {}}}}, separators=(",", ":")).encode("utf-8")
+LIGHT_PERMS = b"".join(perm_record(u, [u], [LUSER, G_LROOM, G_LCAT]) for u in (LC, DIM, FAVONLY))
+
+
+class LightsAppTest(unittest.TestCase):
+    """Controlli luci e riordino dell'app: preferiti, importanza, circuiti, controlli nascosti."""
+
+    def update(self, text: str):
+        return appstructure.update_app(Program(LIGHT_SAMPLE.encode("utf-8")), Program(text.encode("utf-8")),
+                                       LIGHT_APP, LIGHT_PERMS, now=NOW)
+
+    def test_favorite_rating_and_circuit_names(self):
+        text = editor.set_iodata(LIGHT_SAMPLE, LC, {"UseInFav": "true", "Rating": "9"})
+        text = editor.set_block_attr(text, LC, {"NameAI0": "Luminosità", "NameAI1": "Colore"})
+        self.assertIn('<IoData Visu="true" Cr=', text)
+        upd = self.update(text)
+        self.assertEqual(upd.unsupported, [])
+        c = json.loads(upd.data)["controls"][f"U:{LC}"]
+        self.assertEqual((c["name"], c["isFavorite"], c["defaultRating"]), ("Led camera", True, 9))  # nome = Desc
+        self.assertEqual([s["name"] for s in c["subControls"].values()], ["Luminosita Generale", "Luminosità", "Colore"])
+        self.assertIsNone(upd.permissions)                                  # stanza e categoria invariate
+        renamed = editor.set_block_attr(LIGHT_SAMPLE, LC, {"Desc": "Strisce LED"})
+        self.assertEqual(json.loads(self.update(renamed).data)["controls"][f"U:{LC}"]["name"], "Strisce LED")
+
+    def test_hidden_controls_and_links(self):
+        text = editor.set_iodata(LIGHT_SAMPLE, DIM, {"Visu": None})
+        text = editor.set_iodata(text, FAVONLY, {"UseInFav": None})        # era solo tra i preferiti
+        upd = self.update(text)
+        self.assertEqual(upd.unsupported, [])
+        app = json.loads(upd.data)
+        self.assertEqual(list(app["controls"]), [f"U:{LC}"])
+        self.assertNotIn("links", app["controls"][f"U:{LC}"])               # il dimmer collegato non c'e' piu'
+        self.assertEqual([r.head for r in appstructure.parse_permissions(upd.permissions)],
+                         [appstructure.uuid_bytes(LC)])
+        self.assertTrue(any("collegamenti" in d for d in upd.done))
+
+    def test_moods_are_not_in_the_app_and_icons_are_left_to_config(self):
+        mood = f'<LightsceneC Name="Aurora" UUID="{U(82)}" Outputs="2" SID="1" CID="12" Q1="268435526" Q2="1073741824"/>'
+        text = LIGHT_SAMPLE.replace('Num="1">', 'Num="2">').replace("</LightscenesC>", mood + "\n</LightscenesC>")
+        a, b = Program(LIGHT_SAMPLE.encode("utf-8")), Program(text.encode("utf-8"))
+        notes = [n for ch in diff(a, b)["modificati"] for n in ch["modifiche"]]
+        self.assertEqual(notes, ["atmosfere aggiunte: Aurora (1)"])
+        self.assertEqual(app_impact(a, b, LIGHT_APP), [])
+        upd = self.update(text)
+        self.assertEqual((upd.done, upd.unsupported, upd.data), ([], [], LIGHT_APP))
+        icon = editor.set_iodata(LIGHT_SAMPLE, LC, {"IconV": U(99)})
+        self.assertEqual(self.update(icon).unsupported, ["'Led camera' <LightController2>: cambia l'icona di un "
+                                                         "controllo luci"])
+
+    def test_set_iodata_only_touches_the_own_element(self):
+        text = editor.set_iodata(HTTP_SAMPLE, CMD2, {"Pr": ROOM, "Rating": "5"})
+        self.assertIn(f'<IoData Visu="true" Cr="{CAT}" Pr="{ROOM}" Rating="5"/>', text)
+        self.assertEqual(text.count(f'Pr="{ROOM}"'), 2)                     # anche l'altro comando era in cucina
+        with self.assertRaises(editor.EditError):
+            editor.set_iodata(HTTP_SAMPLE, HTTP_IN, {"Visu": None})         # l'ingresso non ha un IoData suo
+
+
 class LogTest(unittest.TestCase):
     def test_activation_outcome_reads_only_after_restart(self):
         log = "\n".join([
@@ -434,6 +573,493 @@ class LogTest(unittest.TestCase):
         # un riavvio vecchio non conta se si chiede solo quello dopo un certo momento
         later = activation_outcome(log, since=datetime(2026, 1, 1, 12, 0))
         self.assertEqual((later["riavvio_visto"], later["avviato"]), (False, False))
+
+
+# --- firmware 17.3: elenco dei file via HTTP, programma salvato come .LoxCC, modifiche fatte dall'app ---
+
+LISTING = ("d      0 Nov 21 22:29 .\r\nd      0 May 17 13:24 ..\r\n-  52945 Feb 27 10:00 sps_0001_20240227100033.zip\r\n"
+           "-  89647 Nov 21 22:29 sps_0003_20261121222946.LoxCC\r\n- 100757 Nov 07 21:55 sps_0002_20261107215554.zip\r\n"
+           "-  11728 Nov 21 22:29 permissions.bin\r\n-      2 Nov 07 21:55 nome con spazi.json\r\nd      0 Nov 07 22:01 custom\r\n")
+
+
+class FakeMiniserver(Miniserver):
+    """Miniserver finto: risposte fisse a `request` (WebSocket) e `http_download` (HTTP), nessuna rete."""
+
+    def __init__(self, ws: dict, http: dict):
+        super().__init__(Settings(host="10.0.0.2", user="u", password=None, permission=4, backups_dir=Path("."),
+                                  admin_user=None, admin_password=None))
+        self.ws_replies, self.http_files, self.http_calls = ws, http, []
+
+    def request(self, cmd, encrypted_response=False, timeout=None):
+        return self.ws_replies.get(cmd, {"Code": "200", "value": "{'directory': 'x','content': []}"})
+
+    def http_download(self, path, timeout=60):
+        self.http_calls.append(path)
+        reply = self.http_files.get(path, 404)
+        if isinstance(reply, int):      # un numero = risposta HTTP di errore
+            raise HttpError(f"download di {path} rifiutato (HTTP {reply})", reply)
+        return reply
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+
+class FileListingTest(unittest.TestCase):
+    def test_text_listing_of_the_http_webservice(self):
+        files = parse_file_listing(LISTING)
+        self.assertEqual([f["filename"] for f in files][:2], ["sps_0001_20240227100033.zip",
+                                                              "sps_0003_20261121222946.LoxCC"])
+        self.assertEqual(files[4], {"filename": "nome con spazi.json", "size": 2, "dir": False, "date": "Nov 07 21:55"})
+        self.assertTrue(files[5]["dir"])
+        self.assertEqual(parse_file_listing("Directory empty"), [])
+
+    def test_listing_dates_have_no_year(self):
+        now = datetime(2026, 11, 22, 9, 0)
+        self.assertEqual(listing_time("Nov 21 22:29", now), datetime(2026, 11, 21, 22, 29))
+        self.assertEqual(listing_time("Dec 03 08:15", now), datetime(2025, 12, 3, 8, 15))   # mai nel futuro
+        self.assertIsNone(listing_time("May 17  2021", now))
+        self.assertIsNone(listing_time("", now))
+
+    def test_websocket_first_then_http(self):
+        old = FakeMiniserver({"dev/fslist/prog": {"Code": "200", "value": "{'content': [{'filename': 'a.zip'}]}"}}, {})
+        self.assertEqual(old.list_files("/prog/"), [{"filename": "a.zip"}])
+        self.assertEqual(old.http_calls, [])                                 # firmware fino al 17.2: basta il WebSocket
+        new = FakeMiniserver({}, {"dev/fslist/prog": LISTING.encode()})
+        self.assertEqual(len(new.list_files("prog")), 6)                     # 17.3: elenco vuoto, si passa a HTTP
+        self.assertEqual(FakeMiniserver({}, {"dev/fslist/x": b"Directory empty"}).list_files("x"), [])
+        self.assertEqual(FakeMiniserver({}, {}).list_files("x"), [])         # 404: la cartella non esiste
+        refused = FakeMiniserver({"dev/fslist/x": {"Code": "403", "value": ""}}, {})
+        with self.assertRaises(LoxoneError):
+            refused.list_files("x")
+
+    def test_a_listing_that_cannot_be_read_is_not_an_empty_folder(self):
+        for reply in (503, 403, b"<html>errore</html>"):                     # mai "non ci sono file"
+            with self.subTest(reply=reply), self.assertRaises(LoxoneError):
+                FakeMiniserver({}, {"dev/fslist/x": reply}).list_files("x")
+
+
+class FirmwareSavedProgramTest(unittest.TestCase):
+    """Dopo un aggiornamento del firmware il programma e' un .LoxCC con struttura e permessi in file separati."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.saved = (cli.open_ms, cli.DOWNLOADS)
+        cli.DOWNLOADS = Path(self.tmp.name)
+        self.addCleanup(lambda: setattr(cli, "DOWNLOADS", self.saved[1]))
+        self.addCleanup(lambda: setattr(cli, "open_ms", self.saved[0]))
+
+    def test_pack_program_has_the_members_of_a_config_zip(self):
+        loxcc = uploader.compress_loxcc(SAMPLE.encode("utf-8"))
+        packed = uploader.pack_program(loxcc, {"permissions.bin": b"P" * 32, "LoxAPP3.json": b"{}", "Music.json": b"[]"})
+        with zipfile.ZipFile(io.BytesIO(packed)) as z:
+            self.assertEqual(z.namelist(), ["sps0.LoxCC", "LoxAPP3.json", "permissions.bin", "Music.json"])
+        rebuilt = uploader.build_program_zip(packed, SAMPLE.encode("utf-8"), {"LoxAPP3.json": b'{"a":1}'})
+        self.assertEqual(uploader.read_member(rebuilt, "LoxAPP3.json"), b'{"a":1}')
+        with self.assertRaises(ValueError):
+            uploader.pack_program(b"non e' un LoxCC valido", {})
+
+    def test_download_rebuilds_the_package(self):
+        loxcc = uploader.compress_loxcc(SAMPLE.encode("utf-8"))
+        ms = FakeMiniserver({}, {"dev/fslist/prog": LISTING.encode(),
+                                 "dev/fsget/prog/sps_0003_20261121222946.LoxCC": loxcc,
+                                 "dev/fsget/web/data/LoxAPP3.json": b'{"controls":{}}',
+                                 "dev/fsget/prog/permissions.bin": b"\xff" * 16})
+        cli.open_ms = lambda s: ms
+        notes: list[str] = []
+        dest = cli.download_current_program(None, notes)
+        self.assertEqual(dest.name, "sps_0003_20261121222946.zip")          # il piu' recente, anche se e' un .LoxCC
+        xml, app = read_program(dest)
+        self.assertEqual((xml, app), (SAMPLE.encode("utf-8"), b'{"controls":{}}'))
+        self.assertIn("Emergency.LoxCC", notes[0])                           # dice cosa non ha trovato
+        self.assertEqual(cli.program_saved(dest), datetime(2026, 11, 21, 22, 29, 46))
+
+    def test_download_stops_if_a_piece_cannot_be_read(self):
+        ms = FakeMiniserver({}, {"dev/fslist/prog": LISTING.encode(),
+                                 "dev/fsget/prog/sps_0003_20261121222946.LoxCC": uploader.compress_loxcc(SAMPLE.encode()),
+                                 "dev/fsget/web/data/LoxAPP3.json": b"{}", "dev/fsget/prog/permissions.bin": 503})
+        cli.open_ms = lambda s: ms
+        with self.assertRaisesRegex(LoxoneError, "permissions.bin"):         # mai un pacchetto senza permessi
+            cli.download_current_program(None)
+
+    def test_download_of_a_zip_is_unchanged(self):
+        zipped = uploader.pack_program(uploader.compress_loxcc(SAMPLE.encode("utf-8")), {"LoxAPP3.json": b"{}"})
+        listing = b"- 100757 Nov 07 21:55 sps_0002_20261107215554.zip\r\n-    10 Nov 07 21:55 sps_new.zip\r\n"
+        ms = FakeMiniserver({}, {"dev/fslist/prog": listing, "dev/fsget/prog/sps_0002_20261107215554.zip": zipped})
+        cli.open_ms = lambda s: ms
+        dest = cli.download_current_program(None)
+        self.assertEqual((dest.name, dest.read_bytes()), ("sps_0002_20261107215554.zip", zipped))
+        cli.open_ms = lambda s: FakeMiniserver({}, {})
+        with self.assertRaises(LoxoneError):
+            cli.download_current_program(None)
+
+
+LIGHT_OBJ = ('<C Type="LightController2" V="{v}" U="' + U(40) + '" Title="Luci" WF="{wf}" SpStates="{sp}">'
+             '<Co K="I1" U="' + U(41) + '">{ins}</Co><HCL FROM="{frm}" TO="60481"/>'
+             '<LightscenesC Num="2">{moods}</LightscenesC></C>')
+MOOD_A, MOOD_B = '<LightsceneC Name="Giorno" SID="1"/>', '<LightsceneC Name="Sera" SID="2"/>'
+IN_A, IN_B = f'<In Input="{U(50)}"/>', f'<In Input="{U(51)}" FLG="2"/>'
+PUSH = '<C Type="PuDe" V="178" U="' + U(60) + '" Title="Telefono" pTkn="x"/>'
+CUSTOM_PROGRAM = ('<ControlList Version="3"><C Type="Document" U="' + U(0) + '" Title="Prova">'
+                  + LIGHT_OBJ.format(v=180, wf=1, sp="a", ins=IN_A + IN_B, frm=27199, moods=MOOD_A + MOOD_B)
+                  + '<C Type="LoxCaption" U="' + U(61) + '" Title="Notifiche">' + PUSH + '</C></C></ControlList>')
+
+
+class AppChangesTest(unittest.TestCase):
+    """Modifiche fatte dall'app (cartella custom): quali andrebbero perse con un caricamento."""
+
+    def setUp(self):
+        self.prog = Program(CUSTOM_PROGRAM.encode("utf-8"))
+
+    def kind(self, xml: str) -> str:
+        return custom_change(xml.encode("utf-8"), self.prog)[0]
+
+    def test_what_the_firmware_rewrites_by_itself_is_not_a_change(self):
+        same = LIGHT_OBJ.format(v=178, wf=9, sp="b", ins=IN_B + IN_A, frm=26022, moods=MOOD_A + MOOD_B)
+        self.assertEqual(self.kind(same), "integrata")
+
+    def test_real_changes_are_pending(self):
+        reordered = LIGHT_OBJ.format(v=180, wf=1, sp="a", ins=IN_A + IN_B, frm=27199, moods=MOOD_B + MOOD_A)
+        self.assertEqual(custom_change(reordered.encode(), self.prog), ("in sospeso", "Luci <LightController2>"))
+        renamed = LIGHT_OBJ.format(v=180, wf=1, sp="a", ins=IN_A + IN_B, frm=27199,
+                                   moods=MOOD_A + MOOD_B.replace("Sera", "Notte"))
+        self.assertEqual(self.kind(renamed), "in sospeso")
+        new = '<C Type="AutopilotRule" U="' + U(70) + '" Title="Regola"/>'
+        self.assertEqual(custom_change(new.encode(), self.prog),
+                         ("in sospeso", "Regola <AutopilotRule> (creato dall'app)"))
+
+    def test_push_registrations_are_counted_apart(self):
+        self.assertEqual(self.kind(PUSH), "integrata")                       # gia' nel programma
+        other = PUSH.replace(U(60), U(62))
+        self.assertEqual(self.kind(other), "registrazione")
+        caption = '<C Type="LoxCaption" U="' + U(61) + '" Title="Notifiche">' + other + '</C>'
+        self.assertEqual(self.kind(caption), "registrazione")
+
+    def test_only_files_newer_than_the_program_count(self):
+        def loxcc(xml: str) -> bytes:
+            return uploader.compress_loxcc(xml.encode("utf-8"))
+        reordered = LIGHT_OBJ.format(v=180, wf=1, sp="a", ins=IN_A + IN_B, frm=27199, moods=MOOD_B + MOOD_A)
+        listing = (f"-    300 Nov 07 21:55 {U(62)}.LoxCC\r\n-   3796 Nov 07 22:01 {U(40)}.LoxCC\r\n"
+                   f"-    298 Nov 07 22:03 {U(63)}.LoxCC\r\n-     10 Nov 07 22:05 rotto.LoxCC\r\nd      0 Nov 07 22:01 .\r\n")
+        ms = FakeMiniserver({}, {"dev/fslist/sys/custom": listing.encode(),
+                                 f"dev/fsget/sys/custom/{U(62)}.LoxCC": loxcc(PUSH.replace(U(60), U(62))),
+                                 f"dev/fsget/sys/custom/{U(40)}.LoxCC": loxcc(reordered),
+                                 f"dev/fsget/sys/custom/{U(63)}.LoxCC": loxcc(PUSH.replace(U(60), U(63))),
+                                 "dev/fsget/sys/custom/rotto.LoxCC": b"niente"})
+        saved_open = cli.open_ms
+        self.addCleanup(lambda: setattr(cli, "open_ms", saved_open))
+        cli.open_ms = lambda s: ms
+        year = cli.listing_time("Nov 07 22:01").year
+        # programma salvato alle 21:55:54: il file delle 21:55 e' stato scritto all'avvio, non dall'app
+        pending, registrations = cli.pending_app_changes(None, self.prog, datetime(year, 11, 7, 21, 55, 54))
+        self.assertEqual(registrations, 1)
+        self.assertEqual(pending[0], "Luci <LightController2>")
+        self.assertTrue(pending[1].startswith("rotto.LoxCC (non leggibile"))   # nel dubbio, non si carica
+        # programma salvato dopo (dal firmware o da Config): quelle modifiche sono gia' dentro
+        self.assertEqual(cli.pending_app_changes(None, self.prog, datetime(year, 11, 21, 22, 29, 46)), ([], 0))
+
+
+class LeftoverUploadTest(unittest.TestCase):
+    """Un sps_new.zip rimasto sulla scheda verrebbe caricato a un riavvio successivo: va tolto."""
+
+    def run_cleanup(self, result, quiet=False) -> str:
+        saved = uploader.ftp_delete
+        self.addCleanup(lambda: setattr(uploader, "ftp_delete", saved))
+
+        def fake(host, user, password, path):
+            self.assertEqual(path, "/prog/sps_new.zip")
+            if isinstance(result, Exception):
+                raise result
+            return result
+        uploader.ftp_delete = fake
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cli.remove_leftover_upload(Settings(host="10.0.0.2", user="u", password="p", permission=4,
+                                                backups_dir=Path("."), admin_user=None, admin_password=None),
+                                       "u", "p", quiet=quiet)
+        return err.getvalue()
+
+    def test_reports_only_what_happened(self):
+        self.assertIn("l'ho tolto", self.run_cleanup(True))
+        self.assertEqual(self.run_cleanup(True, quiet=True), "")
+        self.assertEqual(self.run_cleanup(False), "")                        # caricato e rinominato: tutto regolare
+        self.assertIn("cancellalo", self.run_cleanup(OSError("rete")))       # non si sa: lo dice
+
+    def test_a_program_in_another_format_is_not_uploaded(self):
+        def prog(fmt: str | None) -> Program:
+            attr = f' LxAV="{fmt}"' if fmt else ""
+            return Program(SAMPLE.replace('<ControlList Version="1"', f'<ControlList Version="1"{attr}').encode("utf-8"))
+        self.assertIsNone(cli.format_mismatch(prog("88"), prog("88")))
+        self.assertIsNone(cli.format_mismatch(prog(None), prog("88")))        # formato non dichiarato: nessun giudizio
+        self.assertIn("formato 87", cli.format_mismatch(prog("88"), prog("87")))
+
+    def test_restart_does_not_fail_when_the_connection_drops(self):
+        class Dropping(FakeMiniserver):
+            def request(self, cmd, encrypted_response=False, timeout=None):
+                raise ConnectionResetError("chiusa")
+        self.assertEqual(Dropping({}, {}).restart_program()["Code"], "200")
+
+
+class UploadGuardsTest(unittest.TestCase):
+    """Le protezioni del caricamento: nel dubbio ci si ferma."""
+
+    @staticmethod
+    def alarm(states: dict | None = None) -> tuple[Structure, dict]:
+        ids = {name: f"a-{name}" for name in ("armed", "level", "armedDelay")}
+        st = Structure({"rooms": {}, "cats": {}, "controls": {
+            "a": {"name": "Antifurto", "type": "Alarm", "uuidAction": "a", "states": ids}}})
+        return st, {ids[k]: v for k, v in (states or {}).items()}
+
+    def test_alarm_blocks_when_armed_arming_triggered_or_unknown(self):
+        cases = {"INSERITO": {"armed": 1.0, "level": 0.0}, "IN ALLARME": {"armed": 0.0, "level": 2.0},
+                 "fase di inserimento": {"armed": 0.0, "level": 0.0, "armedDelay": 240.0},
+                 "non leggibile": {}}
+        for expected, states in cases.items():
+            st, values = self.alarm(states)
+            with self.subTest(expected):
+                self.assertIn(expected, cli.alarm_block_reason(st, values, {}, 1))
+
+    def test_alarm_free_only_when_really_disarmed(self):
+        st, values = self.alarm({"armed": 0.0, "level": 0.0, "armedDelay": 0.0})
+        self.assertIsNone(cli.alarm_block_reason(st, values, {}, 1))
+        no_alarm = Structure({"rooms": {}, "cats": {}, "controls": {}})
+        self.assertIsNone(cli.alarm_block_reason(no_alarm, {}, {}, 0))       # casa senza antifurto
+        self.assertIn("non visibili", cli.alarm_block_reason(no_alarm, {}, {}, 1))  # c'e', ma questo utente non lo vede
+
+    def test_users_and_permissions_are_seen(self):
+        user = f'<C Type="User" U="{U(80)}" Title="Nuovo" Admin="true"/>'
+        changed = SAMPLE.replace('<C Type="PlaceCaption"', user + '<C Type="PlaceCaption"', 1)
+        self.assertNotEqual(changed, SAMPLE)
+        self.assertEqual(access_changes(Program(SAMPLE.encode()), Program(changed.encode())), ["User: 1 aggiunti"])
+        self.assertEqual(access_changes(Program(changed.encode()), Program(changed.encode())), [])
+
+    def test_inner_elements_of_a_block_are_seen(self):
+        xml = ('<ControlList Version="1"><C Type="Document" U="' + U(0) + '" Title="P"><C Type="LoggerMailer" U="'
+               + U(81) + '" Title="Avviso"><On Text="{}"/></C></C></ControlList>')
+        before, after = Program(xml.format("porta").encode()), Program(xml.format("cancello").encode())
+        notes = diff(before, after)["modificati"][0]["modifiche"]
+        self.assertEqual(notes, ["On.Text: 'porta' -> 'cancello'"])
+        self.assertEqual(diff(before, after, children=False)["modificati"], [])
+
+    def test_secrets_never_shown(self):
+        for text in ("http://admin:Segreta1@10.0.0.5/foto", "x?appid=Segreta1&a=1", "y?access_token=Segreta1",
+                     "client_secret=Segreta1", "Authorization: Bearer Segreta1", "Bearer Segreta1abc"):
+            with self.subTest(text):
+                self.assertNotIn("Segreta1", redact(text))
+        shown = redact_data({"video": {"user": "mario", "url": "http://u:Segreta1@h/", "nome": "Ingresso", "n": 3}})
+        self.assertEqual(shown, {"video": {"user": "***", "url": "http://***@h/", "nome": "Ingresso", "n": 3}})
+
+    def test_only_the_backups_of_this_miniserver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("Backup_10.0.0.2_20260101100000_17030000", "Backup_10.0.0.9_20261201100000_17030000"):
+                (Path(tmp) / name).mkdir()
+            self.assertEqual(len(backups.list_backups(Path(tmp))), 2)
+            self.assertEqual([b["host"] for b in backups.list_backups(Path(tmp), "10.0.0.2")], ["10.0.0.2"])
+            self.assertEqual(len(backups.list_backups(Path(tmp), "10.0.0.2:8080")), 1)
+
+    def test_admin_name_never_with_the_other_password(self):
+        base = dict(host="h", permission=4, backups_dir=Path("."))
+        self.assertEqual(Settings(user="u", password="p", admin_user="a", admin_password=None, **base).upload_creds(),
+                         ("a", None))
+        self.assertEqual(Settings(user="u", password="p", admin_user=None, admin_password=None, **base).upload_creds(),
+                         ("u", "p"))
+
+    def test_rollback_is_verified_only_when_the_upload_was_consumed(self):
+        """Il file piu' recente e' gia' la versione giusta: finche' c'e' sps_new.zip non e' una prova."""
+        saved = (cli.upload_pending, cli.download_current_program, cli.time.sleep)
+        self.addCleanup(lambda: (setattr(cli, "upload_pending", saved[0]),
+                                 setattr(cli, "download_current_program", saved[1]),
+                                 setattr(cli.time, "sleep", saved[2])))
+        with tempfile.TemporaryDirectory() as tmp:
+            current = Path(tmp) / "sps_0001_20260101100000.Loxone"
+            current.write_bytes(SAMPLE.encode("utf-8"))
+            cli.download_current_program = lambda s: current
+            cli.time.sleep = lambda seconds: None
+            cli.upload_pending = lambda s: True
+            self.assertFalse(cli.wait_for_program(None, Program(SAMPLE.encode("utf-8")), seconds=0.02))
+            cli.upload_pending = lambda s: False
+            self.assertTrue(cli.wait_for_program(None, Program(SAMPLE.encode("utf-8")), seconds=5))
+
+
+class UploadFlowTest(unittest.TestCase):
+    """Il percorso intero di 'lox carica' con Miniserver e FTP finti: cosa viene inviato, quando e cosa no."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.old, self.new = SAMPLE.encode("utf-8"), set_parameter(SAMPLE.encode("utf-8"), PULSE_TIME, "0.2")
+        self.backup = Path(tmp.name) / "sps_0001_20260101100000.zip"
+        self.backup.write_bytes(uploader.pack_program(uploader.compress_loxcc(self.old),
+                                                      {"LoxAPP3.json": b'{"controls":{}}', "permissions.bin": b"\xff" * 16}))
+        self.copy = Path(tmp.name) / "copia.Loxone"
+        self.copy.write_bytes(self.new)
+        self.sent, self.deleted, self.restarts = [], [], []
+        self.settings = Settings(host="10.0.0.2", user="u", password="p", permission=4, backups_dir=Path("."),
+                                 admin_user=None, admin_password=None)
+        flow = self
+
+        class FakeAdmin:
+            def __init__(self, settings):
+                pass
+
+            def connect_admin(self):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                pass
+
+            def kill_token(self, forget_saved=True):
+                return True
+
+            def restart_program(self):
+                flow.restarts.append(True)
+
+        class FakeLive(FakeAdmin):
+            values, texts = {}, {}
+
+        def put(host, user, password, data, **kw):
+            self.sent.append(data)
+            return uploader.FtpResult(len(data), self.size_ok)
+
+        def log(*a):
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return (f"{now}.000;Restart SPS by user 'u'\n{now}.100;Loading sps_new.zip\n"
+                    f"{now}.200;Program started: x\n").encode()
+
+        self.size_ok = True
+        structure = Structure({"rooms": {}, "cats": {}, "controls": {}})
+        patches = [
+            mock.patch.object(cli, "Miniserver", FakeAdmin),
+            mock.patch.object(cli, "download_current_program", lambda s, notes=None: self.backup),
+            mock.patch.object(cli, "pending_app_changes", lambda *a: ([], 0)),
+            mock.patch.object(cli, "has_credentials", lambda s: True),
+            mock.patch.object(cli, "live_states", lambda s: (structure, FakeLive(s))),
+            mock.patch.object(cli.time, "sleep", lambda s: None),
+            mock.patch.object(uploader, "ftp_reachable", lambda host: True),
+            mock.patch.object(uploader, "ftp_put_program", put),
+            mock.patch.object(uploader, "ftp_delete", lambda h, u, p, path: self.deleted.append(path) or True),
+            mock.patch.object(uploader, "ftp_download", log),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def upload(self, active=(True,), applica=True, conferma=True):
+        args = argparse.Namespace(file=str(self.copy), applica=applica, conferma=conferma, forza=False, ignora_app=False)
+        with mock.patch.object(cli, "wait_for_program", side_effect=list(active)), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            cli.cmd_upload(args, self.settings)
+        return out.getvalue()
+
+    def sent_program(self, i: int) -> bytes:
+        return decompress(uploader.read_member(self.sent[i], "sps0.LoxCC"))
+
+    def test_success(self):
+        self.assertIn("CARICAMENTO DIRETTO RIUSCITO", self.upload())
+        self.assertEqual((len(self.sent), len(self.restarts), self.deleted), (1, 1, []))
+        self.assertEqual(self.sent_program(0), self.new)
+
+    def test_dry_run_and_missing_consent_send_nothing(self):
+        self.assertIn("[PROVA]", self.upload(applica=False))
+        with self.assertRaisesRegex(LoxoneError, "--conferma"):
+            self.upload(conferma=False)
+        self.assertEqual((self.sent, self.restarts), ([], []))
+
+    def test_failed_activation_goes_back_to_the_old_program(self):
+        with self.assertRaisesRegex(LoxoneError, "ripristinata la versione precedente"):
+            self.upload(active=(False, True))
+        self.assertEqual((len(self.sent), len(self.restarts), self.deleted), (2, 2, []))
+        self.assertEqual(self.sent_program(1), self.old)
+
+    def test_unconfirmed_rollback_says_so_and_deletes_nothing(self):
+        with self.assertRaisesRegex(LoxoneError, "NON confermato"):
+            self.upload(active=(False, False))
+        self.assertEqual(self.deleted, [])       # il Miniserver potrebbe star ripartendo proprio da quel file
+
+    def test_broken_upload_is_removed_and_never_activated(self):
+        self.size_ok = False
+        with self.assertRaisesRegex(LoxoneError, "non verificato"):
+            self.upload()
+        self.assertEqual((self.restarts, self.deleted), ([], ["/prog/sps_new.zip"]))
+
+    def test_armed_alarm_stops_everything(self):
+        with mock.patch.object(cli, "alarm_block_reason", lambda *a: "antifurto 'Casa' INSERITO"), \
+                self.assertRaisesRegex(LoxoneError, "INSERITO"):
+            self.upload()
+        self.assertEqual((self.sent, self.restarts), ([], []))
+
+
+class CopiesAndSecretsTest(unittest.TestCase):
+    XML = ('<ControlList Version="1"><C Type="Document" U="' + U(0) + '" Title="P"><C Type="Page" U="' + U(3)
+           + '" Title="Pagina">\n<C Type="PushButton" U="' + U(90) + '" Title="Tasto" SpStates="' + U(91) + ',' + U(92)
+           + '" Nota="riga 1&#10;riga 2">\n<Co K="Q" U="' + U(93) + '"/>\n</C>\n</C></C></ControlList>')
+
+    def test_a_copy_has_its_own_states_and_keeps_line_breaks(self):
+        block = Program(self.XML.encode("utf-8")).by_uuid[U(90)]
+        copy, _, _ = editor.clone_block(block, editor.UuidFactory(self.XML))
+        self.assertNotIn(U(91), copy)
+        self.assertEqual(len(re.search(r'SpStates="([^"]*)"', copy).group(1).split(",")), 2)
+        self.assertIn("riga 1&#10;riga 2", copy)
+        group, _ = editor.clone_group(self.XML, [U(90)], editor.UuidFactory(self.XML))
+        self.assertNotIn(U(91), group[0])
+        self.assertNotIn(U(92), group[0])
+
+    def test_a_copy_refuses_connectors_the_model_does_not_have(self):
+        block = Program(self.XML.encode("utf-8")).by_uuid[U(90)]
+        with self.assertRaisesRegex(editor.EditError, "Delay"):
+            editor.clone_block(block, editor.UuidFactory(self.XML), overrides={"Delay": {"Def": "60"}})
+
+    def test_env_passwords_do_not_reach_the_programs_we_start(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(config.os.environ), \
+                mock.patch.dict(config._file_secrets, clear=True):
+            config.os.environ.pop("LOXONE_PASSWORD", None)
+            env = Path(tmp) / ".env"
+            env.write_text("LOXONE_PASSWORD=Segreta1\nLOXONE_PROVA=valore\n", encoding="utf-8")
+            config.load_env(env)
+            self.assertNotIn("LOXONE_PASSWORD", config.os.environ)
+            self.assertEqual(config._secret("LOXONE_PASSWORD"), "Segreta1")
+            self.assertEqual(config.os.environ["LOXONE_PROVA"], "valore")
+
+
+class SensitiveControlsTest(unittest.TestCase):
+    """Quali comandi richiedono --conferma (e il consenso esplicito di chi abita la casa)."""
+
+    def setUp(self):
+        self.st = Structure({"rooms": {"r": {"name": "Ingresso"}}, "cats": {}, "controls": {
+            "i": {"name": "Citofono", "type": "Intercom", "uuidAction": "i", "room": "r",
+                  "subControls": {"i/1": {"name": "Apertura", "type": "Pushbutton", "uuidAction": "i/1"}}},
+            "g": {"name": "Apri cancello", "type": "Pushbutton", "uuidAction": "g", "room": "r"},
+            "l": {"name": "Luce sala", "type": "Switch", "uuidAction": "l", "room": "r"},
+            "p": {"name": "Porta casa", "type": "InfoOnlyDigital", "uuidAction": "p", "room": "r"},
+            "s": {"name": "Sirena esterna", "type": "Switch", "uuidAction": "s", "room": "r"},
+            "f": {"name": "Ingresso", "type": "SmartDoorLock", "uuidAction": "f", "room": "r"},
+            "w": {"name": "Sveglia", "type": "AlarmClock", "uuidAction": "w", "room": "r"},
+            "t": {"name": "Monitor ventilatore", "type": "Switch", "uuidAction": "t", "room": "r"},
+        }})
+
+    def reason(self, key: str, protected=()):
+        return self.st.sensitive_reason(self.st.controls[key], protected)
+
+    def test_types_and_their_sub_controls(self):
+        self.assertIn("Intercom", self.reason("i"))
+        self.assertIn("fa parte di 'Citofono'", self.reason("i/1"))          # l'apriporta e' un semplice pulsante
+        self.assertIn("SmartDoorLock", self.reason("f"))                     # tipo non in elenco, ma parla di porte
+        self.assertIsNone(self.reason("w"))
+
+    def test_names_and_user_list(self):
+        self.assertIn("'apri'", self.reason("g"))
+        self.assertIn("'sirena'", self.reason("s"))
+        self.assertIsNone(self.reason("l"))
+        self.assertIsNone(self.reason("t"))                                  # "monitor", "ventilatore": nessun falso allarme
+        self.assertIsNone(self.reason("p"))                                  # sola lettura: non c'e' nulla da comandare
+        self.assertIn("LOXONE_PROTETTI", self.reason("l", ("luce sala",)))
+        self.assertIn("LOXONE_PROTETTI", self.reason("t", ("T",)))           # anche per UUID
 
 
 if __name__ == "__main__":

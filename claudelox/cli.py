@@ -15,6 +15,7 @@ import dataclasses
 import ftplib
 import getpass
 import io
+import ipaddress
 import json
 import os
 import re
@@ -26,19 +27,21 @@ import urllib.request
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from xml.etree import ElementTree
 
 import websocket
 
 from . import appstructure, backups, editor, logs
 from . import program as programmod
 from . import shelly as shellymod
-from . import uploader
-from .client import (LOX_EPOCH, STRUCTURE_CACHE, AuthError, LoxoneError, Miniserver, delete_token, explain,
-                     ll_code, load_token, loose_json)
-from .config import DATA_DIR, Settings, get_settings
+from . import telefono, uploader
+from .client import (LOX_EPOCH, STRUCTURE_CACHE, AuthError, HttpError, LoxoneError, Miniserver, delete_token,
+                     explain, listing_time, ll_code, load_token, loose_json)
+from .config import DATA_DIR, get_settings
 from .loxcc import LoxCCError, read_program
+from .loxcc import decompress as decompress_loxcc
 from .program import Program
-from .structure import (COMMAND_HINTS, READ_ONLY_TYPES, SENSITIVE_TYPES, Structure, mood_list, summarize)
+from .structure import COMMAND_HINTS, READ_ONLY_TYPES, Structure, mood_list, summarize
 
 DEFAULT_CONFIG_EXE = r"C:\Program Files (x86)\Loxone\LoxoneConfig\LoxoneConfig.exe"
 MS_TYPES = {0: "Miniserver (Gen 1)", 1: "Miniserver Go (Gen 1)", 2: "Miniserver (Gen 2)",
@@ -61,6 +64,25 @@ READONLY_RAW = [re.compile(p) for p in (
 
 def warn(msg: str) -> None:
     print(f"[!] {msg}", file=sys.stderr)
+
+
+def interactive() -> bool:
+    """C'e' una persona davanti a un terminale vero? Serve prima di chiedere una password.
+
+    Su Windows isatty() e' vero anche quando l'ingresso e' il dispositivo NUL (comando lanciato da un altro
+    programma): getpass resterebbe in attesa per sempre. GetConsoleMode riesce solo su una console vera."""
+    try:
+        if not sys.stdin.isatty():
+            return False
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            mode = ctypes.c_uint32()
+            handle = ctypes.c_void_p(msvcrt.get_osfhandle(sys.stdin.fileno()))
+            return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+    except (OSError, ValueError, AttributeError):
+        return False
+    return True
 
 
 def fmt_lox_time(t: float | None) -> str:
@@ -91,7 +113,7 @@ def load_structure(args, s) -> tuple[Structure, str]:
             warn(f"Miniserver non disponibile ({e}): uso i dati locali")
     if STRUCTURE_CACHE.exists():
         return Structure(json.loads(STRUCTURE_CACHE.read_text(encoding="utf-8"))), "cache locale"
-    found = backups.latest_structure(s.backups_dir, DOWNLOADS)
+    found = backups.latest_structure(s.backups_dir, DOWNLOADS, s.host)
     if found:
         data, p = found
         return Structure(data), f"programma v{p['version']} del {p['saved']:%d/%m/%Y %H:%M} ({p['origine']})"
@@ -134,8 +156,9 @@ def cmd_login(args, s):
         raise AuthError("imposta LOXONE_USER nel file .env (vedi .env.example)")
     password = s.password
     if not password:
-        if not sys.stdin.isatty():
-            raise AuthError("password non presente nel .env: esegui 'lox login' in un terminale interattivo")
+        if not interactive():
+            raise AuthError("la password va digitata da una persona: apri un terminale nella cartella del progetto "
+                            "ed esegui 'lox login' (su Windows: .\\lox.cmd login)")
         password = getpass.getpass(f"Password Loxone per l'utente '{s.user}' (non viene salvata): ")
     with Miniserver(s).connect(login=False) as ms:
         tok = ms.login_with_password(s.user, password)
@@ -193,7 +216,7 @@ def cmd_controls(args, s):
         return
     print(f"Fonte: {src} - {len(items)} controlli")
     for c in items:
-        flag = " [SICUREZZA]" if c["type"] in SENSITIVE_TYPES else ""
+        flag = " [SICUREZZA]" if st.sensitive_reason(c, s.protected) else ""
         print(f"  - {st.label(c)} cat={st.cat_name(c)} uuid={c.get('uuidAction', c['_uuid'])}{flag}")
 
 
@@ -210,12 +233,12 @@ def cmd_show(args, s):
         print(f"  uuidAction: {c.get('uuidAction')}   categoria: {st.cat_name(c)}   "
               f"protetto da password visu: {'si' if c.get('isSecured') else 'no'}")
         if c.get("details"):
-            print(f"  dettagli: {json.dumps(c['details'], ensure_ascii=False)[:500]}")
+            print(f"  dettagli: {json.dumps(programmod.redact_data(c['details']), ensure_ascii=False)[:500]}")
         if ms is not None:
             states = st.states_of(c, ms.values, ms.texts)
             print(f"  stato: {summarize(c, states)}")
             for name, val in states.items():
-                print(f"    .{name} = {str(val)[:300]}")
+                print(f"    .{name} = {programmod.redact(str(val))[:300]}")
             if c["type"] == "LightControllerV2":
                 print("  scene disponibili (id: nome): " +
                       ", ".join(f"{m.get('id')}: {m.get('name')}" for m in mood_list(states)))
@@ -229,9 +252,9 @@ def cmd_show(args, s):
             hints = COMMAND_HINTS.get(c["type"])
             print(f"  comandi tipici: {', '.join(hints)}" if hints else
                   "  comandi: vedi la documentazione Loxone 'Structure File' per questo tipo")
-        if c["type"] in SENSITIVE_TYPES:
-            print("  ATTENZIONE: controllo di sicurezza, i comandi richiedono --conferma "
-                  "e il consenso esplicito dell'utente")
+        reason = st.sensitive_reason(c, s.protected)
+        if reason:
+            print(f"  ATTENZIONE: {reason}: i comandi richiedono --conferma e il consenso esplicito dell'utente")
     finally:
         if ms is not None:
             ms.close()
@@ -268,9 +291,10 @@ def cmd_command(args, s):
             raise LoxoneError(f"{st.label(c)} e' di sola lettura: non accetta comandi")
         if c.get("isSecured"):
             raise LoxoneError(f"{st.label(c)} e' protetto da password visu: comando non supportato da questo tool")
-        if c["type"] in SENSITIVE_TYPES and not args.conferma:
-            raise LoxoneError(f"{st.label(c)} e' un controllo di SICUREZZA. Ripeti con --conferma solo dopo "
-                              "il consenso esplicito dell'utente.")
+        reason = st.sensitive_reason(c, s.protected)
+        if reason and not args.conferma:
+            raise LoxoneError(f"{st.label(c)}: {reason}. E' un comando di SICUREZZA: ripeti con --conferma solo "
+                              "dopo il consenso esplicito dell'utente per questa azione.")
         before = summarize(c, st.states_of(c, ms.values, ms.texts))
         ll = ms.io(c["uuidAction"], args.comando)
         code = ll_code(ll)
@@ -304,11 +328,11 @@ def read_log_text(args, s) -> tuple[str, str]:
         with open_ms(s) as ms:  # via HTTP: il WebSocket va in timeout sui file grandi (il log supera 1 MB)
             data = ms.http_download("dev/fsget/log/def.log", timeout=60)
         return data.decode("utf-8", "replace"), "Miniserver (live)"
-    for b in reversed(backups.list_backups(s.backups_dir)):
+    for b in reversed(backups.list_backups(s.backups_dir, s.host)):
         f = b["path"] / "log" / "def.log"
         if f.exists():
             return f.read_bytes().decode("utf-8", "replace"), f"backup del {b['date']:%d/%m/%Y %H:%M}"
-    raise LoxoneError("nessun log disponibile nei backup: usa --live (richiede login)")
+    raise LoxoneError("nessun log nei backup di Loxone Config su questo computer")
 
 
 def print_log_summary(text: str, src: str, days: int) -> None:
@@ -337,7 +361,12 @@ def print_log_summary(text: str, src: str, days: int) -> None:
 
 
 def cmd_log(args, s):
-    text, src = read_log_text(args, s)
+    try:
+        text, src = read_log_text(args, s)
+    except LoxoneError as e:
+        if args.live:
+            raise
+        raise LoxoneError(f"{e}: con 'lox log --live' lo leggi dal Miniserver (serve il login)")
     print_log_summary(text, src, args.giorni)
 
 
@@ -359,7 +388,7 @@ DOWNLOADS = DATA_DIR / "programmi"
 
 
 def newest_program(s) -> dict | None:
-    return backups.newest_program(s.backups_dir, DOWNLOADS)
+    return backups.newest_program(s.backups_dir, DOWNLOADS, s.host)
 
 
 def load_program(args, s) -> tuple[Program, str]:
@@ -382,18 +411,42 @@ def program_source(args, s) -> Path:
     return p["path"]
 
 
-def download_current_program(s) -> Path:
-    """Scarica dal Miniserver l'ultima versione del programma in data/programmi/."""
+def download_current_program(s, notes: list[str] | None = None) -> Path:
+    """Scarica dal Miniserver l'ultima versione del programma in data/programmi/, sempre come zip completo.
+
+    Di solito sul Miniserver c'e' lo zip salvato da Loxone Config (o da 'lox carica'). Dopo un aggiornamento del
+    firmware il Miniserver salva invece il programma convertito come .LoxCC, con struttura dell'app e permessi
+    in file separati: in quel caso lo zip viene ricomposto qui (uploader.pack_program). `notes` raccoglie le
+    spiegazioni da mostrare a chi ha chiesto lo scaricamento.
+    """
     with open_ms(s) as ms:
-        names = [f["filename"] for f in ms.list_files("prog")
-                 if backups.PROGRAM_RE.match(f.get("filename", "")) and f["filename"].lower().endswith(".zip")]
+        names = [f["filename"] for f in ms.list_files("prog") if backups.PROGRAM_RE.match(f.get("filename", ""))]
         if not names:
-            raise LoxoneError("nessun programma trovato sul Miniserver")
+            raise LoxoneError("nessun programma trovato sul Miniserver (cartella /prog vuota o non leggibile "
+                              "con questo utente)")
         def key(n):
             m = backups.PROGRAM_RE.match(n)
             return m.group(2), int(m.group(1))
         name = max(names, key=key)
         data = ms.http_download(f"dev/fsget/prog/{name}")
+        if name.lower().endswith(".loxcc"):
+            companions = {}
+            for member, path in uploader.COMPANION_FILES.items():
+                try:
+                    companions[member] = ms.http_download(f"dev/fsget/{path}")
+                except HttpError as e:
+                    if e.status != 404:  # 404 = il file non esiste; altro = non so cosa c'e': mi fermo
+                        raise LoxoneError(f"non riesco a leggere /{path} (HTTP {e.status}): pacchetto incompleto")
+            try:
+                data = uploader.pack_program(data, companions)
+            except LoxCCError as e:
+                raise LoxoneError(f"il programma scaricato ({name}) non e' leggibile: {e}")
+            if notes is not None:
+                missing = [m for m in uploader.COMPANION_FILES if m not in companions]
+                notes.append(f"il Miniserver lo tiene come {name} (salvato dal firmware, di solito dopo un "
+                             "aggiornamento): ricomposto il pacchetto completo con struttura dell'app e permessi"
+                             + (f"; non trovati: {', '.join(missing)}" if missing else ""))
+            name = Path(name).stem + ".zip"
     if not zipfile.is_zipfile(io.BytesIO(data)):
         raise LoxoneError(f"il file scaricato ({name}) non e' un archivio valido")
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
@@ -404,20 +457,31 @@ def download_current_program(s) -> Path:
 
 def print_diff(d: dict) -> None:
     print(f"Aggiunti: {len(d['aggiunti'])}  Rimossi: {len(d['rimossi'])}  Modificati: {len(d['modificati'])}")
+    def more(items: list, shown: int, what: str, indent: str = "  ") -> None:
+        if len(items) > shown:
+            print(f"{indent}... e altri {len(items) - shown} {what} (elenco accorciato)")
+
     for x in d["aggiunti"][:60]:
         print(f"  + {x}")
+    more(d["aggiunti"], 60, "aggiunti")
     for x in d["rimossi"][:60]:
         print(f"  - {x}")
+    more(d["rimossi"], 60, "rimossi")
     for ch in d["modificati"][:80]:
         print(f"  ~ {ch['oggetto']}")
         for note in ch["modifiche"][:12]:
             print(f"      {note}")
+        more(ch["modifiche"], 12, "cambiamenti di questo oggetto", "      ")
+    more(d["modificati"], 80, "oggetti modificati")
 
 
 def cmd_program(args, s):
     if args.azione == "scarica":
-        dest = download_current_program(s)
+        notes: list[str] = []
+        dest = download_current_program(s, notes)
         print(f"Programma attuale del Miniserver salvato in {dest} ({dest.stat().st_size} byte).")
+        for note in notes:
+            print(f"  Nota: {note}.")
         warn("contiene dati riservati dell'impianto: non condividerlo")
         return
     if args.azione == "estrai":
@@ -522,7 +586,7 @@ def cmd_program(args, s):
     elif args.azione == "blocco":
         if not args.testo:
             raise LoxoneError("indica il nome del blocco")
-        hits = prog.find(args.testo)
+        hits = [prog.by_uuid[args.testo]] if args.testo in prog.by_uuid else prog.find(args.testo)
         if not hits:
             raise LoxoneError(f"nessun blocco '{args.testo}'")
         for e in hits[:10]:
@@ -578,14 +642,45 @@ def activation_outcome(log_text: str, since: datetime | None = None) -> dict:
             "riavvio_visto": bool(restarts)}
 
 
-def pending_app_changes(s) -> list[str]:
-    """Modifiche fatte dall'app (timer, scene, Autopilot...) non ancora integrate nel programma.
+CUSTOM_DIRS = ("sys/custom", "prog/custom")
 
-    Il Miniserver le tiene in /prog/custom e le CANCELLA quando carica un nuovo programma
+
+def program_saved(path: Path) -> datetime | None:
+    """Momento in cui il Miniserver ha salvato il programma, dal nome del file (sps_<versione>_<data>)."""
+    m = backups.PROGRAM_RE.match(path.name)
+    return datetime.strptime(m.group(2), "%Y%m%d%H%M%S") if m else None
+
+
+def pending_app_changes(s, current: Program, saved: datetime | None = None) -> tuple[list[str], int]:
+    """Modifiche fatte dall'app (atmosfere, orari, regole...) non ancora dentro il programma `current`, e quanti
+    telefoni si sono registrati per le notifiche push dopo il suo salvataggio (`saved`).
+
+    Il Miniserver le tiene in /sys/custom, un file per oggetto, e le CANCELLA quando carica un nuovo programma
     ("Remove old custom changes"): Loxone Config le integra prima di salvare, il caricamento diretto no.
+    Contano solo i file piu' recenti del programma (gli altri sono gia' dentro: il Miniserver li lascia li') e
+    diversi da cio' che il programma contiene. Un file che non si riesce a leggere conta come modifica in sospeso.
     """
+    pending, registrations = [], 0
+    saved_minute = saved.replace(second=0, microsecond=0) if saved else None
     with open_ms(s) as ms:
-        return [f.get("filename", "?") for f in ms.list_files("prog/custom")]
+        for folder in CUSTOM_DIRS:
+            for f in ms.list_files(folder):
+                name = str(f.get("filename") or "")
+                if f.get("dir") or not name or "/" in name or "\\" in name or name.startswith("."):
+                    continue
+                when = listing_time(str(f.get("date") or ""))
+                if saved_minute and when and when <= saved_minute:
+                    continue  # scritto prima del salvataggio del programma (o nello stesso minuto, all'avvio)
+                try:
+                    kind, label = programmod.custom_change(
+                        decompress_loxcc(ms.http_download(f"dev/fsget/{folder}/{name}")), current)
+                except (LoxoneError, ValueError, IndexError, SyntaxError) as e:  # LoxCC o XML non validi
+                    kind, label = "in sospeso", f"{name} (non leggibile: {e})"
+                if kind == "registrazione":
+                    registrations += 1
+                elif kind == "in sospeso":
+                    pending.append(label)
+    return sorted(set(pending)), registrations
 
 
 def cmd_upload(args, s):
@@ -604,9 +699,20 @@ def cmd_upload(args, s):
     cur_prog = Program(cur_xml)
     d = programmod.diff(cur_prog, new_prog)
     print_diff(d)
-    if not (d["aggiunti"] or d["rimossi"] or d["modificati"]):
+    access = programmod.access_changes(cur_prog, new_prog)
+    if not (d["aggiunti"] or d["rimossi"] or d["modificati"] or access):
         print("Nessuna differenza rispetto al programma attuale: niente da caricare.")
         return
+    if access:
+        print("ATTENZIONE: il file cambia utenti o permessi (" + "; ".join(access) + "). Il caricamento diretto "
+              "non li tocca: si cambiano con Loxone Config.")
+    old_format = format_mismatch(cur_prog, new_prog)
+    if old_format:
+        print(f"ATTENZIONE: {old_format}")
+    if (new_prog.version or "").isdigit() and (cur_prog.version or "").isdigit() and \
+            int(new_prog.version) < int(cur_prog.version):
+        print(f"ATTENZIONE: il file viene dalla versione {new_prog.version}, sul Miniserver c'e' la "
+              f"{cur_prog.version}: cio' che e' cambiato nel frattempo verrebbe perso (vedi il confronto).")
     # la struttura dell'app (LoxAPP3.json) la genera Loxone Config e il Miniserver usa quella dello zip:
     # per le modifiche visibili nell'app la aggiorna il toolkit (appstructure), se sa farlo
     impact = programmod.app_impact(cur_prog, new_prog, cur_app)
@@ -630,50 +736,80 @@ def cmd_upload(args, s):
             print("Struttura dell'app e permessi aggiornati dal toolkit (come li scriverebbe Loxone Config):")
             for line in upd.done:
                 print(f"  + {line}")
-    app_changes = pending_app_changes(s)
+    app_changes, registrations = pending_app_changes(s, cur_prog, program_saved(backup))
     if app_changes:
-        print(f"ATTENZIONE: sul Miniserver ci sono {len(app_changes)} modifiche fatte dall'app (timer, scene, "
-              "Autopilot...) non ancora integrate nel programma: il caricamento diretto le cancellerebbe. "
-              "Usa Loxone Config, che le integra prima di salvare.")
+        print(f"ATTENZIONE: sul Miniserver ci sono {len(app_changes)} modifiche fatte dall'app (atmosfere, orari, "
+              "regole...) non ancora integrate nel programma: il caricamento diretto le cancellerebbe.")
+        for line in app_changes[:20]:
+            print(f"  - {line}")
+        print("Usa Loxone Config, che le integra prima di salvare.")
+    if registrations:
+        print(f"Nota: {registrations} registrazioni di telefoni per le notifiche push sono piu' recenti del "
+              "programma. Con il caricamento il Miniserver le azzera: ogni telefono si registra di nuovo quando "
+              "si riapre l'app, fino ad allora potrebbe non ricevere le notifiche.")
+    # il caricamento diretto usa l'FTP del Miniserver, che dal firmware 16.1 e' spento finche' non lo si attiva
+    ftp_ok = uploader.ftp_reachable(s.host)
+    if not ftp_ok:
+        print("ATTENZIONE: il server FTP del Miniserver non risponde. Dal firmware 16.1 e' disattivato per "
+              "impostazione predefinita: attivalo in Loxone Config (proprieta' del Miniserver, server FTP: "
+              "\"Enabled - TLS only\") e salva nel Miniserver, oppure carica il programma con Loxone Config.")
 
     # 2) controlli di sicurezza prima di toccare il Miniserver
-    alarm_armed, alarm_unknown = None, not has_credentials(s)
-    if not alarm_unknown:
+    alarm_problem = "stato dell'antifurto non leggibile"
+    if has_credentials(s):
         try:
             st, ms = live_states(s)
             with ms:
-                for c in st.find(type_="Alarm"):
-                    if st.states_of(c, ms.values, ms.texts).get("armed"):
-                        alarm_armed = c["name"]
+                blocks = sum(1 for e in cur_prog.components() if e.get("Type") == "Alarm")
+                alarm_problem = alarm_block_reason(st, ms.values, ms.texts, blocks)
         except (LoxoneError, OSError, websocket.WebSocketException):
-            alarm_unknown = True
-    alarm_problem = (f"antifurto '{alarm_armed}' INSERITO" if alarm_armed else
-                     "stato dell'antifurto non leggibile" if alarm_unknown else None)
+            pass
     built = uploader.build_program_zip(backup.read_bytes(), new_xml, replace)
     print(f"Pacchetto sps_new.zip pronto: {len(built)} byte.")
 
+    ftp_user, ftp_pw = s.upload_creds()
+    no_app = cur_app is None  # senza la struttura dell'app nel pacchetto il Miniserver resterebbe senza
     if not args.applica:
-        if impact or app_changes:
-            print("\n[PROVA] Nulla inviato al Miniserver. Questa modifica va caricata con Loxone Config (vedi sopra).")
+        if old_format or access:
+            print("\n[PROVA] Nulla inviato al Miniserver. Questo file non va caricato direttamente (vedi sopra): "
+                  "rifai la modifica partendo dal programma attuale ('lox programma scarica') o usa Loxone Config.")
+        elif impact or app_changes or no_app:
+            print("\n[PROVA] Nulla inviato al Miniserver. Questa modifica va caricata con Loxone Config (vedi sopra)."
+                  + (" Nel programma attuale manca la struttura dell'app." if no_app else ""))
+        elif not ftp_ok:
+            print("\n[PROVA] Nulla inviato al Miniserver. Per il caricamento diretto va prima attivato l'FTP "
+                  "(vedi sopra).")
         else:
             print("\n[PROVA] Nulla inviato al Miniserver. Tutto pronto per il caricamento diretto.")
             print("Per attivarlo davvero: aggiungi --applica --conferma (riavvia la logica per ~10 s).")
+            if not (ftp_user and ftp_pw):
+                print("Prima pero' serve la password dell'utente nel file .env (LOXONE_PASSWORD): il caricamento "
+                      "usa l'FTP e un token amministratore temporaneo.")
         if alarm_problem:
             print(f"ATTENZIONE: {alarm_problem}: non caricare ora.")
         return
 
     if alarm_problem and not args.forza:
         raise LoxoneError(f"{alarm_problem}: caricamento annullato (usa --forza per ignorare)")
+    if access:
+        raise LoxoneError("caricamento annullato: il file cambia utenti o permessi (vedi sopra). Usa Loxone Config.")
+    if old_format:
+        raise LoxoneError("caricamento annullato: il file e' in un formato diverso da quello del programma attivo "
+                          "(vedi sopra). Rifai la modifica partendo da 'lox programma scarica'.")
+    if no_app:
+        raise LoxoneError("caricamento diretto annullato: nel programma attuale manca la struttura dell'app "
+                          "(LoxAPP3.json). Usa Loxone Config ('lox programma apri <file>' e 'Salva nel Miniserver').")
     if impact and not args.ignora_app:
         raise LoxoneError("caricamento diretto annullato: la modifica riguarda controlli visibili nell'app (vedi "
                           "sopra). Usa Loxone Config, oppure --ignora-app se sei certo che l'app non cambi.")
     if app_changes:
         raise LoxoneError("caricamento diretto annullato: cancellerebbe le modifiche fatte dall'app (vedi sopra). "
                           "Usa Loxone Config ('lox programma apri <file>' e 'Salva nel Miniserver').")
+    if not ftp_ok:
+        raise LoxoneError("caricamento diretto annullato: il server FTP del Miniserver non risponde (vedi sopra)")
     if not args.conferma:
         raise LoxoneError("il caricamento riavvia la logica di casa: aggiungi --conferma (serve il consenso dell'utente)")
 
-    ftp_user, ftp_pw = s.upload_creds()
     admin = dataclasses.replace(s, user=ftp_user, password=ftp_pw)
     # verifica dei diritti PRIMA di caricare: mai lasciare un sps_new.zip che non si puo' attivare
     try:
@@ -682,13 +818,27 @@ def cmd_upload(args, s):
     except AuthError as e:
         raise LoxoneError(f"caricamento annullato prima di iniziare: {e}")
     print(f"\nDiritti admin verificati per '{ftp_user}'. Carico sps_new.zip via FTP...")
-    res = uploader.ftp_put_program(s.host, ftp_user, ftp_pw, built)
+    # un sps_new.zip rimasto sulla scheda (incompleto, o mai attivato) verrebbe caricato a un riavvio successivo:
+    # se qualcosa va storto prima del riavvio della logica, va tolto
+    try:
+        res = uploader.ftp_put_program(s.host, ftp_user, ftp_pw, built)
+    except (OSError, EOFError, ftplib.Error) as e:
+        remove_leftover_upload(s, ftp_user, ftp_pw, quiet=True)
+        raise LoxoneError(f"upload FTP interrotto ({e}): nulla e' stato attivato, la casa usa il programma di prima")
     if not res.verified:
-        raise LoxoneError("upload FTP non verificato: interrotto prima del riavvio")
+        remove_leftover_upload(s, ftp_user, ftp_pw, quiet=True)
+        raise LoxoneError("upload FTP non verificato (dimensione diversa sul Miniserver): file tolto, nulla e' "
+                          "stato attivato")
     print(f"  caricato e verificato ({res.uploaded} byte). Riavvio la logica...")
 
     restart_at = datetime.now() - timedelta(seconds=120)  # margine per orologi di PC e Miniserver non allineati
-    with Miniserver(admin).connect_admin() as ms:
+    try:
+        ms = Miniserver(admin).connect_admin()
+    except (LoxoneError, OSError, websocket.WebSocketException) as e:
+        remove_leftover_upload(s, ftp_user, ftp_pw, quiet=True)
+        raise LoxoneError(f"non riesco a collegarmi per riavviare la logica ({e}): programma caricato tolto, "
+                          "nulla e' stato attivato")
+    with ms:
         ms.restart_program()
 
     # VERITA' VERA: il programma attivo sul Miniserver coincide con quello che volevo caricare?
@@ -720,17 +870,72 @@ def cmd_upload(args, s):
 
     # rollback: riporta la versione precedente (anche se il nuovo non si e' attivato)
     print("PROBLEMA nell'attivazione: ripristino la versione precedente...")
-    rb = uploader.build_program_zip(backup.read_bytes(), cur_xml)
-    uploader.ftp_put_program(s.host, ftp_user, ftp_pw, rb)
+    back_ok = False
     try:
+        rb = uploader.build_program_zip(backup.read_bytes(), cur_xml)
+        uploader.ftp_put_program(s.host, ftp_user, ftp_pw, rb)
         with Miniserver(admin).connect_admin() as ms:
             ms.restart_program()
         back_ok = wait_for_program(s, Program(cur_xml))
-        print("Versione precedente ripristinata e verificata." if back_ok
-              else "ATTENZIONE: ripristino inviato ma non confermato: controlla l'impianto.")
-    except LoxoneError:
-        print("ATTENZIONE: ripristino inviato ma non confermato: controlla l'impianto.")
-    raise LoxoneError("attivazione fallita: ripristinata la versione precedente. Controlla il file e riprova.")
+    except (LoxoneError, OSError, EOFError, ftplib.Error, websocket.WebSocketException) as e:
+        warn(f"ripristino interrotto: {e}")
+    if back_ok:
+        print("Versione precedente ripristinata e verificata.")
+        raise LoxoneError("attivazione fallita: ripristinata la versione precedente. Controlla il file e riprova.")
+    raise LoxoneError("attivazione fallita e ripristino NON confermato: controlla subito l'impianto. La versione "
+                      f"precedente e' in {backup}: si ricarica con Loxone Config ('lox programma apri' dopo "
+                      "'lox programma estrai') oppure con 'lox carica'.")
+
+
+def alarm_block_reason(st: Structure, values: dict, texts: dict, blocks: int = 0) -> str | None:
+    """Perche' l'antifurto impedisce di riavviare la logica adesso (None = via libera). Nel dubbio ci si ferma:
+    stato che non arriva, antifurto del programma che questo utente non vede, inserimento in corso, allarme."""
+    alarms = st.find(type_="Alarm")
+    if len(alarms) < blocks:
+        return f"{blocks - len(alarms)} antifurto del programma non visibili a questo utente: stato non leggibile"
+    for c in alarms:
+        state = st.states_of(c, values, texts)
+        if state.get("armed") is None:
+            return f"stato dell'antifurto '{c['name']}' non leggibile"
+        if state.get("armed"):
+            return f"antifurto '{c['name']}' INSERITO"
+        if state.get("level"):
+            return f"antifurto '{c['name']}' IN ALLARME"
+        if state.get("armedDelay"):
+            return f"antifurto '{c['name']}' in fase di inserimento"
+    return None
+
+
+def format_mismatch(current: Program, new: Program) -> str | None:
+    """Il programma da caricare e' nello stesso formato di quello attivo? (attributo LxAV della radice)
+
+    A ogni aggiornamento del firmware il Miniserver converte il programma (misurato il 21/11/2026: da LxAV 87 a
+    88, con oggetti e attributi nuovi). Una copia preparata prima dell'aggiornamento, o una versione vecchia da
+    ripristinare, e' nel formato precedente: Loxone Config la convertirebbe aprendola, il caricamento diretto no.
+    """
+    cur, want = current.root.get("LxAV"), new.root.get("LxAV")
+    if not cur or not want or cur == want:
+        return None
+    return (f"il programma da caricare e' nel formato {want}, quello attivo sul Miniserver nel formato {cur}: e' "
+            "stato preparato prima di un aggiornamento del firmware (o con un'altra versione di Loxone Config). "
+            "Il caricamento diretto non converte i programmi: aprilo e salvalo con Loxone Config, oppure rifai la "
+            "modifica partendo dal programma attuale.")
+
+
+def remove_leftover_upload(s, user: str, password: str, quiet: bool = False) -> None:
+    """Toglie /prog/sps_new.zip se il Miniserver non l'ha consumato (di solito lo carica e lo rinomina).
+
+    Lasciato li', verrebbe caricato a un riavvio successivo, cancellando cio' che e' cambiato nel frattempo."""
+    path = f"{uploader.FTP_DIR}/{uploader.UPLOAD_NAME}"
+    try:
+        removed = uploader.ftp_delete(s.host, user, password, path)
+    except (OSError, EOFError, ftplib.Error) as e:
+        warn(f"non riesco a controllare se {path} e' rimasto sul Miniserver ({e}): se c'e', cancellalo "
+             "(con Loxone Config o un programma FTP) prima di riavviare il Miniserver")
+        return
+    if removed and not quiet:  # se non c'era, il Miniserver l'ha caricato e rinominato, come previsto
+        warn(f"il Miniserver non aveva caricato {path}: l'ho tolto perche' non venga caricato a un riavvio "
+             "successivo")
 
 
 def check_app_structure(s, app_json: bytes) -> None:
@@ -753,16 +958,30 @@ def check_app_structure(s, app_json: bytes) -> None:
               f"{len(served['controls'])} controlli (le app la scaricano da sole)")
 
 
+def upload_pending(s) -> bool:
+    """/prog/sps_new.zip e' ancora li'? Il Miniserver lo rinomina solo dopo averlo caricato e avviato."""
+    with open_ms(s) as ms:
+        return any(f.get("filename") == uploader.UPLOAD_NAME for f in ms.list_files("prog"))
+
+
 def wait_for_program(s, expected: Program, seconds: float = 120) -> bool:
-    """Attende che il programma attivo sul Miniserver coincida con `expected` (riprova durante il riavvio)."""
+    """Attende che il Miniserver abbia avviato il pacchetto caricato e che il programma attivo sia `expected`.
+
+    Il solo confronto non basta: in un ripristino il file piu' recente puo' essere gia' la versione giusta prima
+    ancora del riavvio. La prova e' che sps_new.zip sia stato consumato. Durante il riavvio ogni errore vuol dire
+    "riprova"; gli elementi interni dei blocchi non contano perche' qui si verifica quale programma gira.
+    """
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(5)
         try:
+            if upload_pending(s):
+                continue
             active = Program(read_program(download_current_program(s))[0])
-        except (LoxoneError, OSError, websocket.WebSocketException, ValueError):
-            continue  # Miniserver ancora in riavvio
-        d = programmod.diff(expected, active)
+        except (LoxoneError, OSError, EOFError, websocket.WebSocketException, ValueError, LookupError,
+                zipfile.BadZipFile, ElementTree.ParseError):
+            continue
+        d = programmod.diff(expected, active, children=False)
         if not (d["aggiunti"] or d["rimossi"] or d["modificati"]):
             return True
     return False
@@ -772,8 +991,27 @@ def cmd_raw(args, s):
     if not any(p.match(args.comando) for p in READONLY_RAW) and not args.conferma:
         raise LoxoneError("comando non in elenco di sola lettura: ripeti con --conferma solo se sei sicuro "
                           "e l'utente ha dato il consenso (alcuni comandi riavviano o modificano il Miniserver)")
+    # "dev/..." risponde spesso in XML, "jdev/..." e' lo stesso comando con la risposta in JSON
+    command = f"j{args.comando}" if args.comando.startswith("dev/") else args.comando
     with open_ms(s) as ms:
-        print(json.dumps(ms.request(args.comando), ensure_ascii=False, indent=2))
+        print(json.dumps(ms.request(command), ensure_ascii=False, indent=2))
+
+
+def ping(host: str, count: int = 1, wait_s: float = 1.0) -> bool:
+    """Un dispositivo risponde al ping? Le opzioni cambiano da un sistema all'altro (su macOS -W e' in
+    millisecondi, su Linux in secondi) e Windows esce con 0 anche per "host di destinazione non raggiungibile"."""
+    if os.name == "nt":
+        flags = ["-n", str(count), "-w", str(int(wait_s * 1000))]
+    elif sys.platform == "darwin":
+        flags = ["-c", str(count), "-W", str(int(wait_s * 1000))]
+    else:
+        flags = ["-c", str(count), "-W", str(max(1, round(wait_s)))]
+    try:
+        r = subprocess.run(["ping", *flags, host], capture_output=True, text=True, errors="replace",
+                           timeout=count * (wait_s + 2) + 5)
+    except (OSError, subprocess.TimeoutExpired):  # comando ping assente o bloccato
+        return False
+    return "TTL=" in r.stdout.upper() if os.name == "nt" else r.returncode == 0
 
 
 def host_reachable(host: str, port: int, proto: str) -> bool:
@@ -784,8 +1022,7 @@ def host_reachable(host: str, port: int, proto: str) -> bool:
                 return True
         except OSError:
             return False
-    flag = ["-n", "2", "-w", "1500"] if os.name == "nt" else ["-c", "2", "-W", "2"]
-    return subprocess.run(["ping", *flag, host], capture_output=True).returncode == 0
+    return ping(host, count=2, wait_s=1.5)
 
 
 def shelly_info(host: str) -> str | None:
@@ -802,11 +1039,14 @@ def shelly_info(host: str) -> str | None:
     return f"Shelly gen{d.get('gen', 1)} {model}{extra}, firmware {d.get('ver') or d.get('fw')}"
 
 
-def check_devices(s) -> int:
-    """Stampa lo stato dei dispositivi esterni del programma; restituisce quanti sono irraggiungibili."""
+def check_devices(s) -> int | None:
+    """Stampa lo stato dei dispositivi esterni del programma; restituisce quanti sono irraggiungibili
+    (None se non c'e' un programma locale da cui leggerli)."""
     p = newest_program(s)
     if not p:
-        return 0
+        print("Dispositivi esterni: non verificati, manca una copia locale del programma "
+              "(esegui 'lox programma scarica').")
+        return None
     xml, _ = read_program(p["path"])
     devices = Program(xml).device_hosts()
     by_target: dict[tuple, list[str]] = {}
@@ -827,26 +1067,193 @@ def check_devices(s) -> int:
 
 def cmd_devices(args, s):
     missing = check_devices(s)
-    print("Tutti i dispositivi rispondono." if not missing else f"{missing} indirizzi non rispondono.")
+    if missing is not None:
+        print("Tutti i dispositivi rispondono." if not missing else f"{missing} indirizzi non rispondono.")
 
 
-def expected_shelly_ips(s) -> dict[str, list[str]]:
-    """IP HTTP previsti dal programma -> nomi dei comandi che li usano."""
+def expected_shelly(s) -> dict[str, dict]:
+    """IP HTTP previsti dal programma -> nomi dei comandi che li usano ('titoli') e tipo di Shelly ('tipo')."""
     p = newest_program(s)
     if not p:
         return {}
-    out: dict[str, list[str]] = {}
+    hosts: dict[str, dict] = {}
     for d in Program(read_program(p["path"])[0]).device_hosts():
         if d["proto"] == "tcp" and d["porta"] == 80:
-            out.setdefault(d["host"], []).append(d["titolo"])
-    return out
+            h = hosts.setdefault(d["host"], {"titoli": set(), "comandi": []})
+            h["titoli"].add(d["titolo"] or "?")
+            h["comandi"] += d["comandi"]
+    return {ip: {"titoli": sorted(h["titoli"]), "tipo": shellymod.program_kind(h["comandi"])}
+            for ip, h in hosts.items() if shellymod.looks_like_shelly(h["comandi"])}
+
+
+def lan_prefix(s) -> str:
+    """Prima parte dell'indirizzo della rete di casa (es. "192.168.1."), per cercare i dispositivi."""
+    try:
+        ip = ipaddress.IPv4Address(s.host.split(":")[0])
+    except ValueError:
+        raise LoxoneError("per cercare gli Shelly LOXONE_HOST deve essere un indirizzo IP (es. 192.168.1.10)")
+    return str(ip).rsplit(".", 1)[0] + "."
+
+
+SHELLY_WIFI_LOG = DATA_DIR / "shelly-wifi.log"
+SHELLY_RESET_HELP = """
+Ora metti in configurazione gli Shelly, uno alla volta: questa finestra li trova e li collega da sola.
+  - lampadine: accendi l'interruttore, aspetta 5 secondi, spegni, aspetta 5 secondi; ripeti 5 volte e
+    lascia acceso. Se dopo un minuto qui non succede niente, riprova con accensioni piu' brevi (1-2 secondi).
+  - sensore di movimento (Shelly Motion): tieni premuto il suo tasto per 5 secondi (se non basta, 10).
+  - presa (Plug S): staccala e riattaccala, poi entro un minuto tieni premuto il tasto per 10 secondi.
+Quando uno Shelly e' collegato, se e' una luce lampeggia 3 volte.
+"""
+
+
+def address_in_use(ip: str) -> bool:
+    """Qualcosa risponde su questo indirizzo (porta 80 o ping)."""
+    if not shellymod.is_free(ip):
+        return True
+    return ping(ip, count=1, wait_s=0.8)
+
+
+def ask_wifi_password(ssid: str) -> str:
+    """La password del Wi-Fi la scrive l'utente qui, due volte; resta in memoria solo durante la procedura."""
+    if not interactive():
+        raise LoxoneError("la password del Wi-Fi va scritta in una finestra del terminale: avvia la procedura con "
+                          "doppio clic sul file del Desktop")
+    for _ in range(3):
+        first = getpass.getpass(f'Password del Wi-Fi "{ssid}" (mentre scrivi non compare nulla), poi Invio: ')
+        if getpass.getpass("Scrivila di nuovo, per controllo: ") != first:
+            print("Le due password sono diverse: riprova.")
+        elif not 8 <= len(first) <= 64:
+            print("Una password Wi-Fi ha da 8 a 63 caratteri: riprova.")
+        else:
+            return first
+    raise LoxoneError("password del Wi-Fi non confermata")
+
+
+def setup_shelly_ap(phone, ap: dict, home: str, password: str, hosts: dict, todo: list[str], gateway: str,
+                    prova: bool, log) -> bool:
+    """Collega al Wi-Fi di casa lo Shelly della rete di configurazione 'ap'. False = non e' comparso in rete."""
+    if not telefono.is_open(ap):
+        log(f"{ap['ssid']} ha una password: per configurarlo serve il reset completo dello Shelly.")
+        return True
+    log(f"Trovata la rete {ap['ssid']} (segnale {ap['rssi']} dBm): il telefono si collega...")
+    try:
+        phone.connect_open(ap["ssid"])
+        info = None
+        for _ in range(6):
+            code, text = phone.http(f"http://{shellymod.AP_HOST}/shelly", timeout=5)
+            info = shellymod.device_info(shellymod.AP_HOST, shellymod._loads(text)) if code == 200 else None
+            if info:
+                break
+            time.sleep(2)
+        if not info:
+            raise telefono.PhoneError(f"nessuno Shelly risponde su {shellymod.AP_HOST}")
+        if not shellymod.ssid_matches(ap["ssid"], info["mac"]):  # la password del Wi-Fi non va a uno sconosciuto
+            log(f"{ap['ssid']}: il nome della rete non corrisponde al dispositivo (MAC {info['mac']}): non gli mando "
+                "la password del Wi-Fi.")
+            return True
+        kind = shellymod.device_kind(info)
+        label = f"{info['model']}{' (' + info['app'] + ')' if info['app'] else ''} gen{info['gen']} MAC {info['mac']}"
+        target = next((ip for ip in todo if hosts[ip]["tipo"] == kind), None)
+        if not target:
+            log(f"{label}: il programma non prevede altri indirizzi liberi per il tipo '{kind}': lo lascio cosi'.")
+            return True
+        names = ", ".join(hosts[target]["titoli"])
+        log(f"{label}: lo collego a \"{home}\" con IP fisso {target} ({names}).")
+        if prova:
+            log("[prova] nessuna modifica inviata.")
+            return True
+        how = shellymod.configure_wifi(phone.http, info, home, password, target, gateway, gateway)
+        log("Lo Shelly ha confermato la rete." if how == "ok" else
+            "Dati inviati (lo Shelly ha cambiato rete senza rispondere).")
+    finally:
+        phone.forget(ap["ssid"])  # il telefono torna da solo alla rete di casa, che ha salvata
+        if not phone.wait_for_network(home, 60):
+            log(f"ATTENZIONE: il telefono non e' tornato su \"{home}\": controllalo.")
+    log(f"Attendo lo Shelly su {target} (fino a 2 minuti e mezzo)...")
+    dev = shellymod.wait_for(target, info["mac"], seconds=150)
+    if not dev:  # collegato ma senza l'IP fisso?
+        other = next((d for d in shellymod.scan(target.rsplit(".", 1)[0] + ".") if d["mac"] == info["mac"]), None)
+        if other:
+            log(f"Lo Shelly e' in rete su {other['ip']}: gli assegno {target}.")
+            shellymod.set_static_ip(other, target, gateway, gateway)
+            dev = shellymod.wait_for(target, info["mac"], seconds=60)
+    if not dev:
+        log(f"NON RISPONDE su {target}. Cause possibili: password sbagliata, rete non visibile a 2,4 GHz da li'.")
+        return False
+    todo.remove(target)
+    if dev["gen"] >= 2 and not shellymod.disable_ap(dev):
+        log("ATTENZIONE: la rete di configurazione dello Shelly e' rimasta accesa.")
+    # lampeggiano solo le luci: far "lampeggiare" una presa o un rele' toglie corrente a cio' che e' collegato
+    log(f"OK: {names} risponde su {target}" + (", lampeggia 3 volte." if kind == "luce" else "."))
+    if kind == "luce":
+        shellymod.blink(dev)
+    return True
+
+
+def shelly_wifi(args, s, hosts: dict[str, dict], gateway: str) -> None:
+    """Procedura guidata: per ogni Shelly resettato il telefono (adb) si collega alla sua rete di configurazione e lo
+    collega al Wi-Fi di casa con l'IP fisso previsto dal programma, poi lo ritrova in rete e lo fa lampeggiare."""
+    def log(msg: str) -> None:
+        line = f"[{datetime.now():%H:%M:%S}] {msg}"
+        print(line, flush=True)
+        with SHELLY_WIFI_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%d/%m/%Y} {line}\n")
+
+    DATA_DIR.mkdir(exist_ok=True)
+    prefix = lan_prefix(s)
+    hosts = {ip: h for ip, h in hosts.items() if re.fullmatch(re.escape(prefix) + r"\d+", ip)}
+    order = [ip if "." in ip else prefix + ip for ip in (args.ordine or "").replace(" ", "").split(",") if ip]
+    unknown = [ip for ip in order if ip not in hosts]
+    if unknown:
+        raise LoxoneError(f"indirizzi non previsti dal programma: {', '.join(unknown)}")
+    order += sorted((ip for ip in hosts if ip not in order), key=lambda ip: int(ip.rsplit(".", 1)[1]))
+    phone = telefono.Phone(serial=args.telefono)
+    home = args.ssid or phone.status()["ssid"]
+    if not home or shellymod.SETUP_SSID_RE.match(home):
+        raise LoxoneError("il telefono non e' collegato al Wi-Fi di casa: collegalo oppure indica la rete con --ssid")
+    log(f"Telefono {phone.model()} collegato via USB; rete di casa: \"{home}\".")
+    if not any(n["ssid"] == home and n["freq"] < 3000 for _ in range(2) for n in phone.scan()):  # scansioni parziali
+        warn(f"il telefono non vede \"{home}\" a 2,4 GHz: gli Shelly usano solo i 2,4 GHz (controlla il router)")
+    todo = [ip for ip in order if not address_in_use(ip)]
+    if not todo:
+        log("Tutti gli Shelly previsti dal programma rispondono gia'.")
+        return
+    log("Da ricollegare, in quest'ordine: " + "; ".join(
+        f"{ip} {', '.join(hosts[ip]['titoli'])} ({hosts[ip]['tipo']})" for ip in todo))
+    password = "" if args.prova else ask_wifi_password(home)
+    print(SHELLY_RESET_HELP, flush=True)
+    attempts: dict[str, int] = {}
+    deadline = time.monotonic() + args.minuti * 60
+    log(f"Cerco le reti di configurazione degli Shelly (fino a {args.minuti:g} minuti)...")
+    while todo and time.monotonic() < deadline:
+        aps = [n for n in phone.scan() if shellymod.SETUP_SSID_RE.match(n["ssid"]) and attempts.get(n["ssid"], 0) < 3]
+        if not aps:
+            time.sleep(3)
+            continue
+        ap = max(aps, key=lambda n: n["rssi"])
+        attempts[ap["ssid"]] = attempts.get(ap["ssid"], 0) + 1
+        try:
+            if setup_shelly_ap(phone, ap, home, password, hosts, todo, gateway, args.prova, log):
+                attempts[ap["ssid"]] = 99  # fatto: gli Shelly gen2 tengono accesa la rete fino alla fine
+            else:
+                log("Mi fermo per non configurare altri Shelly allo stesso modo: controlla la password e riavviami.")
+                sys.exit(1)
+        except (telefono.PhoneError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+            log(f"ERRORE con {ap['ssid']}: {e}")
+    if todo:
+        log("Tempo scaduto. Non ancora collegati: " + "; ".join(f"{ip} {', '.join(hosts[ip]['titoli'])}" for ip in todo))
+        sys.exit(1)
+    log("Tutti gli Shelly previsti dal programma sono di nuovo in rete.")
 
 
 def cmd_shelly(args, s):
-    expected = expected_shelly_ips(s)
-    gateway = os.environ.get("LOXONE_LAN_GATEWAY") or s.host.rsplit(".", 1)[0] + ".1"
+    hosts = expected_shelly(s)
+    expected = {ip: h["titoli"] for ip, h in hosts.items()}
+    gateway = os.environ.get("LOXONE_LAN_GATEWAY") or (lan_prefix(s) + "1" if args.azione in ("ip", "wifi") else "")
+    if args.azione == "wifi":
+        return shelly_wifi(args, s, hosts, gateway)
     if args.azione == "trova":
-        prefix = s.host.rsplit(".", 1)[0] + "."
+        prefix = lan_prefix(s)
         found = shellymod.scan(prefix)
         print(f"Shelly trovati in rete {prefix}0/24: {len(found)}")
         for d in sorted(found, key=lambda d: int(d["ip"].rsplit(".", 1)[1])):
@@ -858,7 +1265,7 @@ def cmd_shelly(args, s):
             print("Indirizzi previsti dal programma ancora liberi: " + ", ".join(sorted(missing)))
         return
     if args.azione == "attendi":
-        prefix = s.host.rsplit(".", 1)[0] + "."
+        prefix = lan_prefix(s)
         known = {d["mac"] for d in shellymod.scan(prefix)}
         print(f"In attesa di nuovi Shelly in rete (gia' presenti: {len(known)}), massimo {args.minuti} minuti...",
               flush=True)
@@ -880,6 +1287,9 @@ def cmd_shelly(args, s):
     if not dev:
         raise LoxoneError(f"nessuno Shelly risponde su {args.ip}")
     if args.azione == "lampeggia":
+        if shellymod.device_kind(dev) != "luce" and not args.forza:
+            raise LoxoneError(f"{dev['model']} su {args.ip} non e' una luce: farlo lampeggiare toglie e rida' corrente "
+                              "tre volte a cio' che e' collegato. Se va bene, ripeti con --forza.")
         print(f"Faccio lampeggiare {dev['model']} su {args.ip} per 3 volte...")
         shellymod.blink(dev)
         print("Fatto.")
@@ -918,18 +1328,28 @@ def cmd_health(args, s):
         print(f"Ultimo programma disponibile: v{p['version']} del {p['saved']:%d/%m/%Y %H:%M} "
               f"({age} giorni fa, {p['origine']}). Per aggiornarlo: 'lox programma scarica'")
     live = has_credentials(s)
-    try:
-        text, src = read_log_text(argparse.Namespace(live=args.log_live), s)
-    except (LoxoneError, OSError, websocket.WebSocketException) as e:
-        warn(f"log live non disponibile ({e}): uso il backup")
-        text, src = read_log_text(argparse.Namespace(live=False), s)
+    # log: dal Miniserver se richiesto (--log-live), altrimenti dall'ultimo backup di Config; se la prima scelta
+    # non c'e' si prova l'altra, e senza nessuna delle due il controllo prosegue
+    text = src = None
+    log_problems = []
+    for from_ms in ([args.log_live, not args.log_live] if live else [False]):
+        try:
+            text, src = read_log_text(argparse.Namespace(live=from_ms), s)
+            break
+        except (LoxoneError, OSError, websocket.WebSocketException) as e:
+            log_problems.append(f"{'dal Miniserver' if from_ms else 'dai backup di Config'}: {e}")
     print()
-    print_log_summary(text, src, args.giorni)
+    if text is None:
+        print("Log di sistema: non disponibile (" + "; ".join(log_problems) + ")."
+              + ("" if live else " Dal Miniserver si legge dopo il login."))
+    else:
+        print_log_summary(text, src, args.giorni)
     print()
     check_devices(s)
     print()
     if not live:
-        print("Stato live dei dispositivi: non disponibile (manca il login). Vedi README, sezione 'Credenziali'.")
+        print("Stato live dei controlli: non disponibile, manca il login. Esegui 'lox login' in un terminale "
+              "(vedi README, \"Installazione\").")
         return
     st, ms = live_states(s)
     with ms:
@@ -1009,12 +1429,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("dispositivi", help="raggiungibilita' e modello dei dispositivi esterni (Shelly, ...)"
                    ).set_defaults(fn=cmd_devices)
 
-    a = sub.add_parser("shelly", help="trova gli Shelly in rete, assegna l'IP fisso, li fa lampeggiare")
-    a.add_argument("azione", choices=["trova", "attendi", "ip", "lampeggia"])
+    a = sub.add_parser("shelly", help="trova gli Shelly in rete, assegna l'IP fisso, li fa lampeggiare, li ricollega "
+                                      "al Wi-Fi con il telefono (wifi)")
+    a.add_argument("azione", choices=["trova", "attendi", "ip", "lampeggia", "wifi"])
     a.add_argument("ip", nargs="?", help="indirizzo attuale dello Shelly")
     a.add_argument("nuovo", nargs="?", help="nuovo indirizzo fisso (per 'ip')")
-    a.add_argument("--forza", action="store_true", help="consente un IP non previsto dal programma")
-    a.add_argument("--minuti", type=float, default=30, help="durata massima dell'attesa (per 'attendi')")
+    a.add_argument("--forza", action="store_true",
+                   help="per 'ip': consente un IP non previsto dal programma; per 'lampeggia': anche prese e rele'")
+    a.add_argument("--minuti", type=float, default=30, help="durata massima dell'attesa (per 'attendi' e 'wifi')")
+    a.add_argument("--ssid", help="per 'wifi': rete Wi-Fi di casa (default: quella a cui e' collegato il telefono)")
+    a.add_argument("--ordine", help="per 'wifi': ordine degli indirizzi da assegnare, es. 224,225,222")
+    a.add_argument("--telefono", help="per 'wifi': numero di serie adb del telefono, se ce n'e' piu' di uno")
+    a.add_argument("--prova", action="store_true", help="per 'wifi': trova e riconosce gli Shelly senza cambiare niente")
     a.set_defaults(fn=cmd_shelly)
 
     a = sub.add_parser("programma", help="analisi del programma e modifiche su una copia (il Miniserver non cambia)")
@@ -1047,6 +1473,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    if os.name != "nt":
+        os.umask(0o077)  # programmi scaricati, cache e log contengono dati dell'impianto: solo per il proprietario
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -1055,9 +1483,22 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     try:
         args.fn(args, get_settings())
-    except (LoxoneError, LookupError, editor.EditError, LoxCCError) as e:
+    except (LoxoneError, LookupError, editor.EditError, LoxCCError, telefono.PhoneError) as e:
         print(f"ERRORE: {e}", file=sys.stderr)
         sys.exit(1)
+    except (zipfile.BadZipFile, ElementTree.ParseError) as e:
+        print(f"ERRORE: il file non e' un programma Loxone valido ({e})", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("Interrotto.", file=sys.stderr)
+        sys.exit(130)
     except (OSError, websocket.WebSocketException) as e:
-        print(f"ERRORE di connessione verso il Miniserver: {e}", file=sys.stderr)
+        if isinstance(e, OSError) and e.filename:  # un file del PC, non la rete
+            what = "file non trovato" if isinstance(e, FileNotFoundError) else (e.strerror or str(e))
+            print(f"ERRORE: {what}: {e.filename}", file=sys.stderr)
+            sys.exit(1)
+        print(f"ERRORE di connessione: {e}", file=sys.stderr)
+        print(f"  Controlla che il Miniserver sia acceso, che LOXONE_HOST nel file .env sia il suo indirizzo "
+              f"(ora: {os.environ.get('LOXONE_HOST', '?')}) e che questo computer sia nella stessa rete.",
+              file=sys.stderr)
         sys.exit(2)

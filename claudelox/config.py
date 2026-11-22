@@ -6,10 +6,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE_DIR = ROOT / ".state"   # token e cache: file privati, mai da condividere
+# token e cache: file privati, mai da condividere. CLAUDELOX_STATE_DIR li sposta altrove per chi usa il
+# pacchetto fuori dal toolkit (es. un servizio sul Raspberry con i suoi dati in /var/lib)
+STATE_DIR = Path(os.environ.get("CLAUDELOX_STATE_DIR") or ROOT / ".state")
 DATA_DIR = ROOT / "data"      # esportazioni (snapshot, programmi estratti, report)
 
 DEFAULT_BACKUPS = Path.home() / "Documents" / "Loxone" / "Loxone Config" / "Backups"
+
+
+SECRET_KEYS = ("LOXONE_PASSWORD", "LOXONE_ADMIN_PASSWORD")
+_file_secrets: dict[str, str] = {}  # password del .env: fuori da os.environ, che ping, adb e Config erediterebbero
 
 
 def load_env(path: Path = ROOT / ".env") -> None:
@@ -24,7 +30,14 @@ def load_env(path: Path = ROOT / ".env") -> None:
         key, value = key.strip(), value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
             value = value[1:-1]
-        os.environ.setdefault(key, value)
+        if key in SECRET_KEYS:
+            _file_secrets[key] = value
+        else:
+            os.environ.setdefault(key, value)
+
+
+def _secret(key: str) -> str | None:
+    return os.environ.get(key) or _file_secrets.get(key) or None
 
 
 @dataclass
@@ -38,9 +51,12 @@ class Settings:
     # Se non impostato, si prova l'utente normale (che potrebbe non avere i diritti).
     admin_user: str | None
     admin_password: str | None
+    # controlli in piu' che richiedono --conferma, scelti dall'utente (parte del nome o UUID): LOXONE_PROTETTI
+    protected: tuple[str, ...] = ()
 
     def upload_creds(self) -> tuple[str | None, str | None]:
-        return (self.admin_user or self.user, self.admin_password or self.password)
+        """Utente e password per caricare: mai il nome di uno con la password dell'altro."""
+        return (self.admin_user, self.admin_password) if self.admin_user else (self.user, self.password)
 
 
 def get_settings() -> Settings:
@@ -49,13 +65,21 @@ def get_settings() -> Settings:
     if not host:
         raise SystemExit("ERRORE: indirizzo del Miniserver mancante. Copia .env.example come .env e imposta "
                          "LOXONE_HOST (vedi README, \"Installazione\").")
+    if "://" in host or "/" in host:
+        raise SystemExit(f"ERRORE: LOXONE_HOST deve essere solo l'indirizzo del Miniserver (es. 192.168.1.10), "
+                         f"senza http:// e senza barre: nel file .env c'e' '{host}'.")
+    try:
+        # 4 = token "app" (dura settimane, si rinnova da solo); 2 = token "web" (breve)
+        permission = int(os.environ.get("LOXONE_TOKEN_PERMISSION") or "4")
+    except ValueError:
+        raise SystemExit("ERRORE: LOXONE_TOKEN_PERMISSION nel file .env deve essere un numero (4 oppure 2).")
     return Settings(
         host=host,
         user=os.environ.get("LOXONE_USER") or None,
-        password=os.environ.get("LOXONE_PASSWORD") or None,
-        # 4 = token "app" (dura settimane, si rinnova da solo); 2 = token "web" (breve)
-        permission=int(os.environ.get("LOXONE_TOKEN_PERMISSION", "4")),
-        backups_dir=Path(os.environ.get("LOXONE_BACKUPS_DIR", str(DEFAULT_BACKUPS))),
+        password=_secret("LOXONE_PASSWORD"),
+        permission=permission,
+        backups_dir=Path(os.environ.get("LOXONE_BACKUPS_DIR") or str(DEFAULT_BACKUPS)),
         admin_user=os.environ.get("LOXONE_ADMIN_USER") or None,
-        admin_password=os.environ.get("LOXONE_ADMIN_PASSWORD") or None,
+        admin_password=_secret("LOXONE_ADMIN_PASSWORD"),
+        protected=tuple(p.strip() for p in os.environ.get("LOXONE_PROTETTI", "").split(",") if p.strip()),
     )

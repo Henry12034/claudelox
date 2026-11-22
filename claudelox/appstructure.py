@@ -17,8 +17,11 @@ ricavano dal blocco come fa Config (unita' "<v.1> %" -> formato "%.1f %%", nella
 Nei permessi il controllo nuovo ha gli stessi utenti del modello e i gruppi della sua stanza e della sua
 categoria, ricavati dagli altri controlli che stanno li'.
 Gestiti: controlli nuovi, eliminati, nascosti; nome, stanza, categoria, unita', icona, preferito,
-importanza e frequenza della statistica cambiati. Il resto finisce tra le modifiche non gestite: per
-quelle serve Loxone Config.
+importanza e frequenza della statistica cambiati. Il nome nell'app e' la descrizione del blocco (Desc) se c'e',
+altrimenti il titolo. Dei controlli luci (LightControllerV2) anche nome, stanza, categoria, preferito, importanza,
+nomi dei circuiti (NameAI0... -> sotto-controlli AI1...) e oggetti collegati (linkC -> links); le atmosfere non
+sono in LoxAPP3.json (l'app le chiede al Miniserver). I collegamenti (links) a controlli tolti o nascosti spariscono.
+Il resto finisce tra le modifiche non gestite: per quelle serve Loxone Config.
 """
 from __future__ import annotations
 
@@ -28,14 +31,17 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .program import UUID_RE, Program, alarm_sensors_only
+from .program import UUID_RE, Program, alarm_sensors_only, changed_children
 
 UNIT_RE = re.compile(r"<v(?:\.(\d))?>")
 # attributi dei blocchi che contano solo per la logica, non per l'app
 LOGIC_ATTRS = {"Check", "Address", "Poll", "Timeout", "Allowedtimeouts", "Signed", "Analog", "SourceValLow",
-               "SourceValHigh", "DestValLow", "DestValHigh", "MinVal", "MaxVal", "ValOT", "Formula", "Desc",
+               "SourceValHigh", "DestValLow", "DestValHigh", "MinVal", "MaxVal", "ValOT", "Formula",
                "IName", "Cl", "WF", "V", "LtE", "Nio", "on", "Px", "Py", "Px2", "Py2", "StatsAutoDel"}
+NAME_ATTRS = {"Title", "Desc", "StatsType"}         # nome nell'app (Desc, se c'e', altrimenti Title) e statistica
 IODATA_HANDLED = {"Pr", "Cr", "Visu", "UseInFav", "Rating", "IconV"}
+LIGHTS = "LightControllerV2"                        # controllo composto gestito (vedi _Updater.change_lights)
+LIGHT_ATTRS = re.compile(r"NameAI(\d+)|linkC")      # nomi dei circuiti e oggetti collegati di un controllo luci
 SEP_PARTS, SEP_ACCESS, SEP_END = 0xFE, 0xFC, 0xFF
 SEPARATORS = {bytes([b]) * 16 for b in (0xFE, 0xFC, 0xFD, 0xFF)}
 ROOM_GROUP, CAT_GROUP = "1", "2"  # attributo GT dei gruppi di permessi (RightGroup)
@@ -135,6 +141,11 @@ def _visible(e) -> bool:
     return _io(e).get("Visu") == "true"
 
 
+def app_name(prog: Program, e) -> str:
+    """Nome del controllo nell'app: la descrizione del blocco, se c'e', altrimenti il titolo (come Config)."""
+    return e.get("Desc") or prog.title(e)
+
+
 def _connectors(e) -> dict[str, str]:
     return {co.get("K"): co.get("U") for co in e.findall("Co")}
 
@@ -146,6 +157,7 @@ class _Updater:
         self.done: list[str] = []
         self.unsupported: list[str] = []
         self.icons: dict[str | None, str | None] = {}  # IconV del blocco -> icona del controllo
+        self.removed: set[str] = set()                 # controlli tolti dall'app
         for c in self.controls.values():
             b = old.by_uuid.get(c.get("uuidAction"))
             if b is not None:
@@ -201,7 +213,7 @@ class _Updater:
 
     def fill(self, c: dict, e, label: str) -> bool:
         """Campi del controllo ricavati dal blocco (nome, stanza, categoria, icona, formato, statistica)."""
-        io, title = _io(e), self.new.title(e)
+        io, title = _io(e), app_name(self.new, e)
         if io.get("Pr") not in self.app["rooms"] or io.get("Cr") not in self.app["cats"]:
             self.unsupported.append(f"{label}: stanza o categoria che l'app non conosce ancora")
             return False
@@ -288,16 +300,18 @@ class _Updater:
 
     def remove(self, key: str, block_u: str, what: str) -> None:
         del self.controls[key]
+        self.removed.add(block_u)
         if self.perms is not None:
             head = uuid_bytes(block_u)
             self.perms[:] = [r for r in self.perms if r.head != head]
         self.done.append(what)
 
     def change(self, ea, eb, key: str) -> None:
-        label = f"'{self.new.title(eb)}' <{eb.get('Type')}>"
+        label = f"'{app_name(self.new, eb)}' <{eb.get('Type')}>"
         ia, ib = _io(ea), _io(eb)
         va, vb = ia.get("Visu") == "true", ib.get("Visu") == "true"
-        if va and not vb and ib.get("UseInFav") != "true":
+        if (va or ia.get("UseInFav") == "true") and not (vb or ib.get("UseInFav") == "true"):
+            # ne' visibile ne' tra i preferiti: non sta piu' nell'app (anche se prima era solo tra i preferiti)
             self.remove(key, eb.get("U"), f"nascosto nell'app: {label}")
             return
         if va != vb or (not vb and ia.get("UseInFav") != ib.get("UseInFav")):
@@ -308,15 +322,21 @@ class _Updater:
         if "Objects" in attrs and alarm_sensors_only(self.old, ea, self.new, eb):
             attrs.discard("Objects")   # sensori tolti dalla configurazione dell'antifurto: solo logica
         io_changes = {k for k in set(ia) | set(ib) if ia.get(k) != ib.get(k)}
-        relevant = attrs - {"Title", "StatsType"} | (io_changes - IODATA_HANDLED)
+        lights = self.controls[key].get("type") == LIGHTS
+        relevant = {a for a in attrs - NAME_ATTRS if not (lights and LIGHT_ATTRS.fullmatch(a))}
+        relevant |= io_changes - IODATA_HANDLED
         da, db = ea.find("Display"), eb.find("Display")
         disp = {k for k in set(da.attrib if da is not None else {}) | set(db.attrib if db is not None else {})
                 if (da.get(k) if da is not None else None) != (db.get(k) if db is not None else None)}
         relevant |= {f"Display.{k}" for k in disp - {"Unit"}}
+        relevant |= {f"<{t}>" for t in changed_children(ea, eb) if t != "Display"}  # altri elementi: solo Config
         if relevant:
             self.unsupported.append(f"{label}: cambiano {', '.join(sorted(relevant))}")
             return
         if not (attrs or io_changes or disp):
+            return
+        if lights:
+            self.change_lights(eb, key, label, attrs, io_changes)
             return
         if {"subControls", "links"} & set(self.controls[key]):
             self.unsupported.append(f"{label}: controllo composto (sotto-controlli), lo aggiorna solo Config")
@@ -336,6 +356,65 @@ class _Updater:
         self.controls[key] = c
         self.done.append(f"aggiornato nell'app: {label}")
 
+    def change_lights(self, eb, key: str, label: str, attrs: set[str], io_changes: set[str]) -> None:
+        """Controllo luci (LightControllerV2): campi del controllo, nomi dei circuiti, oggetti collegati.
+
+        I sotto-controlli (luminosita' generale, un dimmer o un selettore di colore per circuito) restano quelli
+        di Config: cambia solo il nome di quelli dei circuiti rinominati (NameAI<n> -> "<uuid>/AI<n+1>").
+        """
+        c = copy.deepcopy(self.controls[key])
+        io = _io(eb)
+        if "IconV" in io_changes:
+            self.unsupported.append(f"{label}: cambia l'icona di un controllo luci")
+            return
+        if {"Pr", "Cr"} & io_changes:
+            if io.get("Pr") not in self.app["rooms"] or io.get("Cr") not in self.app["cats"]:
+                self.unsupported.append(f"{label}: stanza o categoria che l'app non conosce ancora")
+                return
+            c.update(room=io["Pr"], cat=io["Cr"])
+            rec = self.record(eb.get("U")) if self.perms is not None else None
+            if self.perms is not None:
+                if rec is None:
+                    self.unsupported.append(f"{label}: nessun record dei permessi da aggiornare")
+                    return
+                new_rec = copy.deepcopy(rec)
+                if not self.regroup(new_rec, c, label):
+                    return
+                rec.sections = new_rec.sections
+        c.update(name=app_name(self.new, eb), isFavorite=io.get("UseInFav") == "true",
+                 defaultRating=int(io.get("Rating") or 0))
+        subs = c.get("subControls", {})
+        for attr in sorted(attrs):
+            m = LIGHT_ATTRS.fullmatch(attr)
+            if m and m.group(1) is not None:
+                sub = subs.get(f"{eb.get('U')}/AI{int(m.group(1)) + 1}")
+                if sub is None or eb.get(attr) is None:
+                    self.unsupported.append(f"{label}: circuiti aggiunti o tolti, li aggiorna solo Config")
+                    return
+                sub["name"] = eb.get(attr)
+        if "linkC" in attrs:
+            links = [u for u in (eb.get("linkC") or "").split(",") if u]
+            if links:
+                c["links"] = links
+            else:
+                c.pop("links", None)
+        self.controls[key] = c
+        self.done.append(f"aggiornato nell'app: {label}")
+
+    def prune_links(self) -> None:
+        """Oggetti collegati (links) che non sono piu' controlli dell'app: tolti o nascosti."""
+        known = {c.get("uuidAction") for c in self.controls.values()}
+        for c in self.controls.values():
+            links = c.get("links")
+            if links and any(u not in known for u in links):
+                kept = [u for u in links if u in known]
+                gone = len(links) - len(kept)
+                if kept:
+                    c["links"] = kept
+                else:
+                    del c["links"]
+                self.done.append(f"'{c.get('name')}': tolti {gone} collegamenti a controlli non piu' nell'app")
+
     def run(self, referenced: set[str]) -> None:
         old_u = {e.get("U"): e for e in self.old.components() if e.get("U")}
         new_u = {e.get("U"): e for e in self.new.components() if e.get("U")}
@@ -353,6 +432,8 @@ class _Updater:
         for u, eb in new_u.items():
             if self.key_of(u) is None and _visible(eb) and (u not in old_u or not _visible(old_u[u])):
                 self.add(eb)
+        if self.done:
+            self.prune_links()
         text = dump(self.app)
         gone = {u for u in old_u.keys() - new_u.keys()}
         gone |= {co for u in gone for co in _connectors(old_u[u]).values()}
@@ -360,6 +441,10 @@ class _Updater:
         left = sorted(u for u in gone if u in text or uuid_bytes(u) in perm_bytes)
         if left:
             self.unsupported.append(f"l'app o i permessi usano ancora oggetti eliminati: {', '.join(left[:3])}")
+        cited = sorted(u for u in self.removed - gone if u in text)
+        if cited:  # es. una luce nascosta che un comando centrale elenca ancora nei suoi dettagli
+            names = ", ".join(self.old.title(old_u[u]) for u in cited[:3])
+            self.unsupported.append(f"{names}: tolti dall'app ma ancora usati da un altro controllo")
 
     @staticmethod
     def _differs(ea, eb) -> bool:

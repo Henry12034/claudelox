@@ -120,7 +120,7 @@ def main() -> None:
     if args.file:
         src = Path(args.file)
     else:
-        p = backups.newest_program(get_settings().backups_dir, DATA_DIR / "programmi")
+        p = backups.newest_program(get_settings().backups_dir, DATA_DIR / "programmi", get_settings().host)
         if not p:
             raise SystemExit("ERRORE: nessun programma locale, esegui prima 'lox programma scarica'")
         src = p["path"]

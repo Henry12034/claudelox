@@ -80,6 +80,44 @@ def read_member(zip_bytes: bytes, name: str) -> bytes | None:
         return z.read(name) if name in z.namelist() else None
 
 
+# File che il Miniserver tiene accanto al programma quando lo salva da se' come .LoxCC (dopo un aggiornamento
+# del firmware): membro dello zip -> percorso sulla scheda. Sono gli stessi che Loxone Config mette nello zip.
+COMPANION_FILES = {
+    APP_MEMBER: "web/data/LoxAPP3.json",
+    PERMISSIONS_MEMBER: "prog/permissions.bin",
+    "Emergency.LoxCC": "prog/Emergency.LoxCC",
+    "Music.json": "prog/Music.json",
+}
+
+
+def pack_program(program_loxcc: bytes, companions: dict[str, bytes]) -> bytes:
+    """Ricompone lo zip del programma da un .LoxCC e dai file che il Miniserver gli tiene accanto.
+
+    Dopo un aggiornamento del firmware il Miniserver salva il programma convertito come sps_XXXX_<data>.LoxCC
+    (misurato il 21/11/2026 passando da 17.2 a 17.3), non piu' come zip: struttura dell'app, permessi e
+    programma di emergenza restano in file separati. Lo zip ricomposto ha gli stessi membri, nello stesso
+    ordine, di quello che scrive Loxone Config.
+    """
+    decompress(program_loxcc)  # deve essere un programma valido
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(PROGRAM_MEMBER, program_loxcc)
+        for name in COMPANION_FILES:
+            if companions.get(name) is not None:
+                z.writestr(name, companions[name])
+    return out.getvalue()
+
+
+def ftp_reachable(host: str, timeout: float = 4) -> bool:
+    """Il server FTP del Miniserver risponde? Dal firmware 16.1 e' spento finche' non lo si attiva in Config."""
+    import socket
+    try:
+        with socket.create_connection((host, 21), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _tls_ctx() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False      # certificato CloudDNS non valido per l'IP locale
@@ -135,13 +173,20 @@ def ftp_download(host: str, user: str, password: str, path: str) -> bytes:
             pass
 
 
-def ftp_delete(host: str, user: str, password: str, path: str) -> None:
+def ftp_delete(host: str, user: str, password: str, path: str) -> bool:
+    """Cancella un file dal Miniserver. False se il file non c'era (risposta 550)."""
     import ftplib
     ftp = ftplib.FTP_TLS(context=_tls_ctx())
     ftp.connect(host, 21, timeout=20)
     ftp.login(user, password)
     try:
-        ftp.delete(path)
+        try:
+            ftp.delete(path)
+        except ftplib.error_perm as e:
+            if str(e).startswith("550"):
+                return False
+            raise
+        return True
     finally:
         try:
             ftp.quit()

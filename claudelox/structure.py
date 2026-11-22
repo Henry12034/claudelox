@@ -12,6 +12,18 @@ SENSITIVE_TYPES = {
     "Gate", "CentralGate", "Window", "CentralWindow", "Intercom", "IntercomV2", "NfcCodeTouch",
 }
 
+# Un tipo nuovo o poco comune il cui nome contiene una di queste parole ("SmartDoorLock" = Smart, Door, Lock)
+# vale come di sicurezza.
+SENSITIVE_TYPE_WORDS = {"alarm", "gate", "door", "lock", "window", "intercom", "nfc", "access"}
+NOT_SENSITIVE_TYPES = {"AlarmClock", "WindowMonitor"}  # sveglia; stato di porte e finestre (solo lettura)
+TYPE_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+# Molti impianti aprono porta o cancello con un semplice pulsante: il tipo non lo dice, il nome di solito si'.
+# Parole intere del nome (minuscole, senza accenti), oppure inizi di parola.
+SENSITIVE_NAME_WORDS = {"door", "gate", "lock", "open", "tor", "tur", "schloss", "offnen", "offner", "porta", "porte",
+                        "pedonale", "carraio", "carrabile", "serranda", "serrande"}
+SENSITIVE_NAME_STEMS = ("apri", "sblocc", "serratur", "elettroserratur", "cancell", "porton", "garage", "bascul",
+                        "allarm", "antifurt", "siren", "unlock", "alarm", "turoffn")
+
 READ_ONLY_TYPES = {"InfoOnlyAnalog", "InfoOnlyDigital", "InfoOnlyText", "TextState", "Webpage"}
 
 # Comandi documentati da Loxone ("Structure File" v16.0) per i tipi piu' comuni
@@ -78,6 +90,33 @@ class Structure:
     def label(self, c: dict) -> str:
         parent = f" (sotto '{self.controls[c['_parent']]['name']}')" if c["_parent"] else ""
         return f"{c['name']} [{self.room_name(c)}] <{c['type']}>{parent}"
+
+    def sensitive_reason(self, c: dict, protected: tuple[str, ...] = ()) -> str | None:
+        """Perche' un comando a questo controllo richiede --conferma (None = non lo richiede).
+
+        Vale per i tipi di sicurezza, per i loro sotto-controlli (l'apriporta di un intercom e' un semplice
+        pulsante), per i nomi che fanno pensare a porte, cancelli e allarmi e per i controlli elencati
+        dall'utente in LOXONE_PROTETTI (parte del nome o UUID). I controlli di sola lettura non contano.
+        """
+        node, own = c, True
+        while node is not None:
+            t = str(node.get("type") or "")
+            words = {w.lower() for w in TYPE_WORD_RE.findall(t)}
+            if t in SENSITIVE_TYPES or (t not in NOT_SENSITIVE_TYPES and words & SENSITIVE_TYPE_WORDS):
+                return f"controllo di sicurezza <{t}>" if own else f"fa parte di '{node.get('name')}' <{t}>"
+            node = self.controls.get(node["_parent"]) if node.get("_parent") else None
+            own = False
+        if c.get("type") in READ_ONLY_TYPES:
+            return None
+        name = norm(str(c.get("name") or ""))
+        ids = {str(c.get("_uuid", "")).lower(), str(c.get("uuidAction", "")).lower()}
+        for item in protected:
+            if item and (norm(item) in name or item.lower() in ids):
+                return f"protetto nel file .env (LOXONE_PROTETTI: {item})"
+        for word in name.replace("/", " ").replace("-", " ").split():
+            if word in SENSITIVE_NAME_WORDS or word.startswith(SENSITIVE_NAME_STEMS):
+                return f"il nome fa pensare a porte, cancelli o allarmi ('{word}')"
+        return None
 
     def find(self, text: str | None = None, room: str | None = None, type_: str | None = None,
              cat: str | None = None, include_sub: bool = False) -> list[dict]:
@@ -178,6 +217,8 @@ def summarize(c: dict, st: dict) -> str:
     if t == "LightsceneRGB":
         return f"scena {st.get('activeScene')}, colore {st.get('color')}"
     if t == "Alarm":
+        if st.get("armed") is None:
+            return "stato non disponibile"
         return ("INSERITO" if st.get("armed") else "disinserito") + f", livello {st.get('level')}"
     compact = {k: v for k, v in st.items() if k != "jLocked"}
     return json.dumps(compact, ensure_ascii=False)[:300]

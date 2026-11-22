@@ -30,7 +30,8 @@ def lox_now() -> int:
 
 
 def escape_attr(value: str) -> str:
-    return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+    value = value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+    return value.replace("\r", "&#13;").replace("\n", "&#10;").replace("\t", "&#9;")  # se no diventano spazi
 
 
 def newline_of(text: str) -> str:
@@ -114,6 +115,8 @@ def clone_block(template, ids: UuidFactory, *, title: str | None = None, positio
     if "LtE" in new_attrs:
         new_attrs["LtE"] = str(ids.stamp)
     _set_attrs(new_attrs, attrs)
+    if new_attrs.get("SpStates") and "SpStates" not in (attrs or {}):  # gli stati di un blocco hanno UUID propri
+        new_attrs["SpStates"] = ",".join(ids.block() if u else u for u in new_attrs["SpStates"].split(","))
     lines = ["<C " + " ".join(f'{k}="{escape_attr(v)}"' for k, v in new_attrs.items()) + ">"]
     connectors: dict[str, str] = {}
     i = -1
@@ -153,6 +156,9 @@ def clone_block(template, ids: UuidFactory, *, title: str | None = None, positio
             lines.append("\t</Co>")
         else:
             lines.append("\t<Co " + " ".join(parts) + " />")
+    unknown = sorted(set(overrides) - set(connectors))
+    if unknown:
+        raise EditError(f"il blocco modello <{template.get('Type')}> non ha i connettori {', '.join(unknown)}")
     lines += ["\t" + line for child in children or [] for line in child.split("\n")]
     lines.append("</C>")
     return "\n".join(lines), block_u, connectors
@@ -169,6 +175,99 @@ def insert_children(text: str, parent_uuid: str, blocks: list[str]) -> str:
         raise EditError("formato inatteso del contenitore")
     lines = [indent + "\t" + line for b in blocks for line in b.split("\n")]
     return text[:line_start] + nl.join(lines) + nl + text[line_start:]
+
+
+ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _rewrite_tag(tag: str, changes: dict[str, str | None]) -> str:
+    """Tag di apertura con gli attributi cambiati (None toglie): gli altri restano dove sono, i nuovi in fondo."""
+    m = re.match(r"<(\w+)", tag)
+    closing = "/>" if tag.endswith("/>") else ">"
+    attrs = dict(ATTR_RE.findall(tag[m.end():]))
+    for k, v in changes.items():
+        if v is None:
+            attrs.pop(k, None)
+        else:
+            attrs[k] = escape_attr(v)
+    body = "".join(f' {k}="{v}"' for k, v in attrs.items())
+    return f"<{m.group(1)}{body}{closing}"
+
+
+def set_block_attr(text: str, uuid: str, changes: dict[str, str | None]) -> str:
+    """Cambia attributi del blocco (es. Title, Desc, NameAI0): None toglie l'attributo."""
+    start, _ = element_span(text, uuid)
+    end = text.index(">", start) + 1
+    return text[:start] + _rewrite_tag(text[start:end], changes) + text[end:]
+
+
+def set_child_attr(text: str, uuid: str, tag: str, changes: dict[str, str | None], missing: str | None = None) -> str:
+    """Cambia un elemento DEL blocco (IoData, Display, LoggerMailer...), non quelli dei blocchi contenuti
+    (es. i comandi di un ingresso virtuale). None toglie l'attributo."""
+    start, end = element_span(text, uuid)
+    open_end = text.index(">", start) + 1
+    depth = 0
+    for m in re.compile(r"<(/?)C\b[^>]*?(/?)>|<%s\b[^>]*?/?>" % re.escape(tag)).finditer(text, open_end, end):
+        if not m.group(0).startswith(f"<{tag}"):
+            depth += -1 if m.group(1) else (0 if m.group(2) else 1)
+        elif depth == 0:
+            return text[:m.start()] + _rewrite_tag(m.group(0), changes) + text[m.end():]
+    raise EditError(missing or f"oggetto {uuid} senza elemento <{tag}>")
+
+
+def set_iodata(text: str, uuid: str, changes: dict[str, str | None]) -> str:
+    """Cambia l'elemento IoData DEL blocco (stanza Pr, categoria Cr, Visu, UseInFav, Rating...), non quello
+    dei blocchi contenuti (es. i comandi di un ingresso virtuale). None toglie l'attributo."""
+    return set_child_attr(text, uuid, "IoData", changes,
+                          missing=f"oggetto {uuid} senza IoData (stanza, categoria, visibilita')")
+
+
+UUID_VALUE_RE = re.compile(r'(\w+)="([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{16})"')
+
+
+def clone_group(text: str, uuids: list[str], ids: UuidFactory, *, offset: tuple[int, int] = (0, 0)
+                ) -> tuple[list[str], dict[str, str]]:
+    """Copia un gruppo di blocchi (una logica intera) con UUID nuovi, contenuto compreso (StateTexts, LoggerMailer...).
+
+    I collegamenti e i riferimenti tra blocchi del gruppo puntano alle copie; quelli verso l'esterno restano
+    uguali (es. un ingresso alimentato da un blocco fuori dal gruppo, Ref= a una notifica, stanza e categoria).
+    Le posizioni si spostano di `offset`, LtE diventa l'ora attuale. Si copiano solo blocchi singoli.
+    Restituisce (testi da passare a insert_children, {uuid vecchio: uuid nuovo} di blocchi e connettori).
+    """
+    found = []
+    mapping: dict[str, str] = {}
+    for u in uuids:
+        a, b = element_span(text, u)
+        chunk = text[a:b]
+        if len(re.findall(r"<C\b", chunk)) > 1:
+            raise EditError("si copiano solo blocchi singoli, non contenitori (pagine, dispositivi)")
+        if re.search(r'\sUUID="', chunk):
+            raise EditError(f"oggetto {u}: elementi con un proprio UUID (es. atmosfere), copia non supportata")
+        new_u = ids.block()
+        mapping[u] = new_u
+        for i, cu in enumerate(re.findall(r'<Co\b[^>]*\sU="([0-9a-f-]+)"', chunk)):
+            mapping[cu] = ids.connector(new_u, i)
+        found.append((text[text.rfind("\n", 0, a) + 1:a], chunk))
+    dx, dy = offset
+    out = []
+    for indent, chunk in found:
+        chunk = UUID_VALUE_RE.sub(lambda m: f'{m.group(1)}="{mapping.get(m.group(2), m.group(2))}"', chunk)
+        chunk = re.sub(r'\bSpStates="([^"]*)"',   # gli stati di un blocco hanno UUID propri: mai condivisi
+                       lambda m: 'SpStates="' + ",".join(ids.block() if u else u for u in m.group(1).split(",")) + '"',
+                       chunk)
+        head_end = re.match(r'<C\b(?:[^>"]|"[^"]*")*>', chunk).end()
+        head = chunk[:head_end]
+        changes = {k: str(int(v) + (dx if k.startswith("Px") else dy))
+                   for k, v in re.findall(r'\s(Px2?|Py2?)="(-?\d+)"', head)}
+        if re.search(r'\sLtE="', head):
+            changes["LtE"] = str(ids.stamp)
+        lines = (_rewrite_tag(head, changes) + chunk[head_end:]).replace("\r\n", "\n").split("\n")
+        for i in range(1, len(lines)):
+            if not lines[i].startswith(indent):
+                raise EditError("formato inatteso del blocco da copiare")
+            lines[i] = lines[i][len(indent):]
+        out.append("\n".join(lines))
+    return out, mapping
 
 
 def _with_nc(tag: str, n: int) -> str:
